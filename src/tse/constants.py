@@ -1,0 +1,17 @@
+from __future__ import annotations
+
+from datetime import time
+from decimal import Decimal
+
+REFERENCE_CAPTURE_TIME = time(9, 3, 0)
+DROP_THRESHOLD_PCT = Decimal("1.0")
+REBOUND_THRESHOLD_PCT = Decimal("0.2")
+MIN_PROFIT_LOCK_PCT = Decimal("1.0")
+PROFIT_PRESERVATION_SELL_PCT = Decimal("80.0")
+MAX_WATCH_SYMBOLS = 20
+EPS = Decimal("0.0001")
+PCT_Q = Decimal("0.0001")
+QUOTE_POLL_INTERVAL_MS = 1000
+QUOTE_POLL_TIMEOUT_MS = 700
+QUOTE_CONSECUTIVE_ERROR_THRESHOLD = 3
+QUOTE_RECOVERY_SUCCESS_THRESHOLD = 2
