@@ -11,6 +11,7 @@ class CsmEndpointResolver:
     ROUTES: dict[ServiceType, tuple[str, str]] = {
         "auth": ("POST", "/oauth2/token"),
         "quote": ("POST", "/api/dostk/mrkcond"),
+        "chart": ("POST", "/api/dostk/chart"),
         "order": ("POST", "/api/dostk/ordr"),
         "execution": ("POST", "/api/dostk/websocket"),
     }

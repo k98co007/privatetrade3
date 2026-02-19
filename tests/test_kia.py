@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 import sys
 from decimal import Decimal
@@ -89,6 +91,7 @@ def test_live_quote_401_triggers_single_force_refresh_and_retry(tmp_path: Path) 
             return 200, {
                 "symbol": payload["stk_cd"],
                 "cur_prc": "70100",
+                "hts_kor_isnm": "삼성전자",
                 "tick_size": 1,
                 "as_of": "2026-02-17T09:00:00+00:00",
             }
@@ -108,6 +111,7 @@ def test_live_quote_401_triggers_single_force_refresh_and_retry(tmp_path: Path) 
     quote = gateway.fetch_quote(FetchQuoteRequest(mode="live", symbol="005930"))
 
     assert quote.symbol == "005930"
+    assert quote.symbol_name == "삼성전자"
     assert str(quote.price) == "70100"
     assert token_issue_count == 2
     assert quote_count == 2
@@ -218,6 +222,48 @@ def test_fetch_quotes_batch_returns_partial_with_symbol_errors(tmp_path: Path) -
     assert quote_api_ids == ["ka10007", "ka10007"]
 
 
+def test_fetch_quotes_batch_falls_back_to_request_symbol_when_missing_in_response(tmp_path: Path) -> None:
+    repo = _write_runtime_files(
+        tmp_path,
+        mode="live",
+        credential={
+            "appKey": "APPKEY",
+            "appSecret": "APPSECRET",
+            "liveBaseUrl": "https://live.example",
+            "mockBaseUrl": "https://mock.example",
+        },
+    )
+
+    def transport(method: str, url: str, headers: dict[str, str], payload: dict | None, query: dict | None, timeout: float):
+        if url.endswith("/oauth2/token"):
+            return 200, {"token": "token-1", "expires_in": 120}
+        if url.endswith("/api/dostk/mrkcond"):
+            return 200, {
+                "cur_prc": "70100",
+                "tick_size": 1,
+                "as_of": "2026-02-17T09:00:00+00:00",
+            }
+        raise AssertionError("unexpected URL")
+
+    gateway = DefaultKiaGateway(
+        api_client=RoutingKiaApiClient(
+            csm_repository=repo,
+            transport=transport,
+            retry_base_delay_seconds=0,
+            retry_max_delay_seconds=0,
+            sleep_fn=lambda _seconds: None,
+            rand_fn=lambda _a, _b: 0,
+        )
+    )
+
+    result = gateway.fetch_quotes_batch(
+        PollQuotesRequest(mode="live", symbols=["005930", "000660"], poll_cycle_id="cycle-fallback", timeout_ms=1000)
+    )
+
+    assert [quote.symbol for quote in result.quotes] == ["005930", "000660"]
+    assert result.partial is False
+
+
 def test_fetch_quotes_batch_enforces_one_request_per_second(tmp_path: Path) -> None:
     repo = _write_runtime_files(
         tmp_path,
@@ -275,6 +321,103 @@ def test_fetch_quotes_batch_enforces_one_request_per_second(tmp_path: Path) -> N
     assert result.partial is False
     assert len(sleep_calls) == 2
     assert all(delay == pytest.approx(1.0) for delay in sleep_calls)
+
+
+def test_quote_waits_while_order_request_is_in_flight(tmp_path: Path) -> None:
+    repo = _write_runtime_files(
+        tmp_path,
+        mode="live",
+        credential={
+            "appKey": "APPKEY",
+            "appSecret": "APPSECRET",
+            "liveBaseUrl": "https://live.example",
+            "mockBaseUrl": "https://mock.example",
+        },
+    )
+
+    order_started = threading.Event()
+    allow_order_finish = threading.Event()
+
+    def transport(method: str, url: str, headers: dict[str, str], payload: dict | None, query: dict | None, timeout: float):
+        if url.endswith("/oauth2/token"):
+            return 200, {"token": "token-1", "expires_in": 120}
+        if url.endswith("/api/dostk/ordr"):
+            order_started.set()
+            assert allow_order_finish.wait(timeout=1.0)
+            return 200, {
+                "ord_no": "ORD-1",
+                "client_order_id": "CID-ORDER",
+                "status": "ACCEPTED",
+                "accepted_at": "2026-02-17T09:00:00+00:00",
+            }
+        if url.endswith("/api/dostk/mrkcond"):
+            assert allow_order_finish.is_set() is True
+            return 200, {
+                "symbol": str((payload or {}).get("stk_cd", "005930")),
+                "cur_prc": "70100",
+                "tick_size": 1,
+                "as_of": "2026-02-17T09:00:00+00:00",
+            }
+        raise AssertionError("unexpected URL")
+
+    gateway = DefaultKiaGateway(
+        api_client=RoutingKiaApiClient(
+            csm_repository=repo,
+            transport=transport,
+            retry_base_delay_seconds=0,
+            retry_max_delay_seconds=0,
+            sleep_fn=lambda _seconds: None,
+            rand_fn=lambda _a, _b: 0,
+            quote_min_interval_seconds=0.0,
+        )
+    )
+
+    order_error: list[Exception] = []
+    quote_error: list[Exception] = []
+    quote_done = threading.Event()
+
+    def run_order() -> None:
+        try:
+            gateway.submit_order(
+                SubmitOrderRequest(
+                    mode="live",
+                    account_no="12345678",
+                    symbol="005930",
+                    side="BUY",
+                    order_type="LIMIT",
+                    price=Decimal("70000"),
+                    quantity=1,
+                    client_order_id="CID-ORDER",
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            order_error.append(exc)
+
+    def run_quote() -> None:
+        try:
+            gateway.fetch_quote(FetchQuoteRequest(mode="live", symbol="005930"))
+            quote_done.set()
+        except Exception as exc:  # pragma: no cover
+            quote_error.append(exc)
+            quote_done.set()
+
+    order_thread = threading.Thread(target=run_order)
+    order_thread.start()
+    assert order_started.wait(timeout=1.0)
+
+    quote_thread = threading.Thread(target=run_quote)
+    quote_thread.start()
+
+    time.sleep(0.05)
+
+    allow_order_finish.set()
+
+    order_thread.join(timeout=1.0)
+    quote_thread.join(timeout=1.0)
+
+    assert not order_error
+    assert not quote_error
+    assert quote_done.is_set() is True
 
 
 def test_fetch_quotes_batch_validates_input() -> None:
@@ -445,5 +588,58 @@ def test_mode_switch_invalidates_previous_mode_token_cache(tmp_path: Path) -> No
     gateway.fetch_quote(FetchQuoteRequest(mode="live", symbol="005930"))
 
     assert issued == 2
+
+
+def test_fetch_reference_price_0903_uses_ka10080_chart_and_returns_latest_trade(tmp_path: Path) -> None:
+    repo = _write_runtime_files(
+        tmp_path,
+        mode="live",
+        credential={
+            "appKey": "APPKEY",
+            "appSecret": "APPSECRET",
+            "liveBaseUrl": "https://live.example",
+            "mockBaseUrl": "https://mock.example",
+        },
+    )
+
+    captured_api_ids: list[str | None] = []
+    captured_payloads: list[dict | None] = []
+
+    def transport(method: str, url: str, headers: dict[str, str], payload: dict | None, query: dict | None, timeout: float):
+        if url.endswith("/oauth2/token"):
+            return 200, {"token": "token-1", "expires_in": 120}
+        if url.endswith("/api/dostk/chart"):
+            captured_api_ids.append(headers.get("api-id"))
+            captured_payloads.append(payload)
+            return 200, {
+                "stk_min_pole_chart_qry": [
+                    {"cntr_tm": "20260219090500", "cur_prc": "70200"},
+                    {"cntr_tm": "20260219090305", "cur_prc": "70110"},
+                    {"cntr_tm": "20260219090301", "cur_prc": "70100"},
+                    {"cntr_tm": "20260219090259", "cur_prc": "70090"},
+                ]
+            }
+        raise AssertionError("unexpected URL")
+
+    gateway = DefaultKiaGateway(
+        api_client=RoutingKiaApiClient(
+            csm_repository=repo,
+            transport=transport,
+            retry_base_delay_seconds=0,
+            retry_max_delay_seconds=0,
+            sleep_fn=lambda _seconds: None,
+            rand_fn=lambda _a, _b: 0,
+        )
+    )
+
+    reference = gateway.fetch_reference_price_0903(mode="live", symbol="005930")
+
+    assert reference == Decimal("70110")
+    assert captured_api_ids == ["ka10080"]
+    assert captured_payloads and captured_payloads[0] is not None
+    assert captured_payloads[0]["stk_cd"] == "005930"
+    assert captured_payloads[0]["tic_scope"] == "1"
+    assert captured_payloads[0]["upd_stkpc_tp"] == "1"
+    assert len(str(captured_payloads[0]["base_dt"])) == 8
 
 

@@ -33,3 +33,17 @@ def compute_sell_limit_price(current_price: Decimal) -> Decimal:
     if sell_price <= 0:
         raise ValueError("OPM_INVALID_SELL_PRICE")
     return sell_price
+
+
+def compute_buy_limit_price(current_price: Decimal, *, ticks_up: int = 2) -> Decimal:
+    if current_price <= 0:
+        raise ValueError("OPM_INVALID_BUY_PRICE")
+    if ticks_up < 0:
+        raise ValueError("ticks_up must be non-negative")
+
+    buy_price = current_price
+    for _ in range(ticks_up):
+        tick = resolve_kospi_tick_size(buy_price)
+        buy_price += tick
+
+    return buy_price

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
+
+from opm.tick_rules import compute_buy_limit_price
 
 from .constants import MAX_WATCH_SYMBOLS, REFERENCE_CAPTURE_TIME
 from .models import (
@@ -27,6 +29,14 @@ from .rules import (
     should_update_tracked_low,
 )
 from .scheduler import SymbolScanScheduler
+
+_MARKET_TIMEZONE = timezone(timedelta(hours=9))
+
+
+def _to_market_time(value: datetime) -> dt_time:
+    if value.tzinfo is None:
+        return value.time()
+    return value.astimezone(_MARKET_TIMEZONE).time()
 
 
 class TseService:
@@ -66,7 +76,7 @@ class TseService:
             return output
         if not is_positive_price(event.current_price):
             return output
-        if event.occurred_at.time() < REFERENCE_CAPTURE_TIME:
+        if _to_market_time(event.occurred_at) < REFERENCE_CAPTURE_TIME:
             return output
 
         symbol_ctx = self.ctx.symbols[event.symbol]
@@ -224,7 +234,7 @@ class TseService:
             command_id=self._next_command_id(event.trading_date, candidate.symbol, "BUY"),
             trading_date=event.trading_date,
             symbol=candidate.symbol,
-            order_price=candidate.current_price,
+            order_price=compute_buy_limit_price(candidate.current_price, ticks_up=2),
             reason_code="TSE_REBOUND_BUY_SIGNAL",
         )
         output.commands.append(command)

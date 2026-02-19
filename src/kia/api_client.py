@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Callable
@@ -69,6 +70,19 @@ class MockKiaApiClient:
         if service_type == "quote":
             symbol = str((payload or {}).get("stk_cd") or "UNKNOWN")
             return self.fetch_quote_raw(mode=mode, symbol=symbol, api_id=api_id or "ka10007")
+        if service_type == "chart":
+            symbol = str((payload or {}).get("stk_cd") or "UNKNOWN")
+            return {
+                "stk_cd": symbol,
+                "stk_min_pole_chart_qry": [
+                    {
+                        "cur_prc": "70000",
+                        "cntr_tm": "20260219090300",
+                    }
+                ],
+                "return_code": 0,
+                "return_msg": "정상적으로 처리되었습니다",
+            }
         if service_type == "order":
             return self.submit_order_raw(
                 mode=mode,
@@ -175,7 +189,7 @@ class LiveKiaApiClient:
         sleep_fn: Callable[[float], None] | None = None,
         rand_fn: Callable[[float, float], float] | None = None,
         monotonic_fn: Callable[[], float] | None = None,
-        quote_min_interval_seconds: float = 1.0,
+        quote_min_interval_seconds: float = 0.25,
         idempotency_store: InMemoryIdempotencyStore | None = None,
     ) -> None:
         self._endpoint_resolver = endpoint_resolver
@@ -371,33 +385,35 @@ class LiveKiaApiClient:
         idempotency_key: str | None,
         token: str | None = None,
     ) -> dict[str, Any]:
-        if service_type == "quote":
-            self._enforce_quote_rate_limit()
+        request_guard = self._quote_rate_lock if service_type != "quote" else nullcontext()
+        with request_guard:
+            if service_type == "quote":
+                self._enforce_quote_rate_limit()
 
-        endpoint = self._endpoint_resolver.resolve(mode, service_type)
-        headers = {
-            "Content-Type": "application/json;charset=UTF-8",
-            "cont-yn": cont_yn,
-            "next-key": next_key,
-        }
-        if token:
-            headers["authorization"] = f"Bearer {token}"
-        if api_id:
-            headers["api-id"] = api_id
-        if idempotency_key:
-            headers["X-Idempotency-Key"] = idempotency_key
+            endpoint = self._endpoint_resolver.resolve(mode, service_type)
+            headers = {
+                "Content-Type": "application/json;charset=UTF-8",
+                "cont-yn": cont_yn,
+                "next-key": next_key,
+            }
+            if token:
+                headers["authorization"] = f"Bearer {token}"
+            if api_id:
+                headers["api-id"] = api_id
+            if idempotency_key:
+                headers["X-Idempotency-Key"] = idempotency_key
 
-        try:
-            status, response = self._transport(
-                endpoint.method,
-                f"{endpoint.base_url}{endpoint.path}",
-                headers,
-                payload,
-                query,
-                self._timeout_seconds,
-            )
-        except Exception as exc:  # pragma: no cover - mapper is covered
-            raise map_exception(exc) from exc
+            try:
+                status, response = self._transport(
+                    endpoint.method,
+                    f"{endpoint.base_url}{endpoint.path}",
+                    headers,
+                    payload,
+                    query,
+                    self._timeout_seconds,
+                )
+            except Exception as exc:  # pragma: no cover - mapper is covered
+                raise map_exception(exc) from exc
 
         if status < 200 or status >= 300:
             raise map_http_status(status, response)
@@ -406,11 +422,10 @@ class LiveKiaApiClient:
         return response
 
     def _enforce_quote_rate_limit(self) -> None:
-        if self._quote_min_interval_seconds <= 0:
-            return
-
         sleep_fn = self._sleep_fn if self._sleep_fn is not None else time.sleep
         with self._quote_rate_lock:
+            if self._quote_min_interval_seconds <= 0:
+                return
             now = self._monotonic_fn()
             if self._last_quote_sent_at is not None:
                 elapsed = now - self._last_quote_sent_at
@@ -434,7 +449,7 @@ class RoutingKiaApiClient:
         sleep_fn: Callable[[float], None] | None = None,
         rand_fn: Callable[[float, float], float] | None = None,
         monotonic_fn: Callable[[], float] | None = None,
-        quote_min_interval_seconds: float = 1.0,
+        quote_min_interval_seconds: float = 0.25,
     ) -> None:
         self._resolver = CsmEndpointResolver(csm_repository=csm_repository)
         self._transport = transport

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from decimal import Decimal
+import logging
+from datetime import datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .api_client import RoutingKiaApiClient
@@ -23,6 +24,12 @@ from .contracts import (
 from .errors import make_kia_error
 
 
+_LOGGER = logging.getLogger("privatetrade.kia.gateway")
+_REFERENCE_MINUTE_START = dt_time(hour=9, minute=3, second=0)
+_REFERENCE_MINUTE_END = dt_time(hour=9, minute=3, second=59)
+_KST = timezone(timedelta(hours=9))
+
+
 def _parse_dt(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value
@@ -34,6 +41,54 @@ def _parse_dt(value: Any) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _resolve_symbol(value: Any, *, fallback: str = "") -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback.strip()
+
+
+def _resolve_symbol_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _parse_non_negative_price(value: Any) -> Decimal:
+    text = str(value).strip()
+    if not text:
+        return Decimal("0")
+    return abs(Decimal(text.replace(",", "")))
+
+
+def _is_negative_signed_price_text(value: Any) -> bool:
+    text = str(value).strip()
+    return bool(text) and text.lstrip().startswith("-")
+
+
+def _parse_hhmmss(value: Any) -> dt_time | None:
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) < 6:
+        return None
+    digits = digits[-6:]
+    try:
+        hour = int(digits[0:2])
+        minute = int(digits[2:4])
+        second = int(digits[4:6])
+        return dt_time(hour=hour, minute=minute, second=second)
+    except ValueError:
+        return None
+
+
+def _is_reference_minute(time_value: dt_time) -> bool:
+    return _REFERENCE_MINUTE_START <= time_value <= _REFERENCE_MINUTE_END
+
+
 class DefaultKiaGateway:
     def __init__(self, api_client: RoutingKiaApiClient | None = None, *, csm_repository: Any | None = None) -> None:
         self._api_client = api_client or RoutingKiaApiClient(csm_repository=csm_repository)
@@ -41,12 +96,89 @@ class DefaultKiaGateway:
     def fetch_quote(self, req: FetchQuoteRequest) -> MarketQuote:
         raw = self._api_client.fetch_quote_raw(mode=req.mode, symbol=req.symbol, api_id="ka10007")
         price_value = raw.get("cur_prc", raw.get("price", "0"))
+        try:
+            normalized_price = _parse_non_negative_price(price_value)
+        except (InvalidOperation, ValueError):
+            _LOGGER.warning(
+                "Invalid quote price format: symbol=%s raw_cur_prc=%s raw_price=%s mode=%s",
+                req.symbol,
+                raw.get("cur_prc"),
+                raw.get("price"),
+                req.mode,
+            )
+            normalized_price = Decimal("0")
+
+        if _is_negative_signed_price_text(raw.get("cur_prc")) or _is_negative_signed_price_text(raw.get("price")):
+            _LOGGER.warning(
+                "Signed quote price detected: symbol=%s raw_cur_prc=%s raw_price=%s normalized=%s mode=%s",
+                req.symbol,
+                raw.get("cur_prc"),
+                raw.get("price"),
+                format(normalized_price, "f"),
+                req.mode,
+            )
+
         return MarketQuote(
             symbol=str(raw.get("symbol", req.symbol)),
-            price=Decimal(str(price_value)),
+            price=normalized_price,
             tick_size=int(raw.get("tick_size", 1)),
             as_of=_parse_dt(raw.get("as_of")),
+            symbol_name=_resolve_symbol_name(
+                raw.get(
+                    "symbol_name",
+                    raw.get(
+                        "name",
+                        raw.get(
+                            "stk_nm",
+                            raw.get("hts_kor_isnm", raw.get("prdt_abrv_name", raw.get("isu_nm"))),
+                        ),
+                    ),
+                )
+            ),
         )
+
+    def fetch_reference_price_0903(self, *, mode: Mode | None, symbol: str) -> Decimal | None:
+        base_dt = datetime.now(_KST).strftime("%Y%m%d")
+        raw = self._api_client.call(
+            service_type="chart",
+            mode=mode,
+            payload={
+                "stk_cd": symbol,
+                "tic_scope": "1",
+                "upd_stkpc_tp": "1",
+                "base_dt": base_dt,
+            },
+            api_id="ka10080",
+        )
+        rows = raw.get("stk_min_pole_chart_qry", [])
+        if not isinstance(rows, list):
+            return None
+
+        best_time: dt_time | None = None
+        best_price: Decimal | None = None
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            trade_time = _parse_hhmmss(row.get("cntr_tm"))
+            if trade_time is None or not _is_reference_minute(trade_time):
+                continue
+
+            try:
+                normalized_price = _parse_non_negative_price(row.get("cur_prc", row.get("price", "0")))
+            except (InvalidOperation, ValueError):
+                continue
+            if normalized_price <= 0:
+                continue
+
+            if best_time is None or trade_time > best_time:
+                best_time = trade_time
+                best_price = normalized_price
+
+        if best_price is None:
+            return None
+
+        return best_price
 
     def fetch_quotes_batch(self, req: PollQuotesRequest) -> PollQuotesResult:
         if not (1 <= len(req.symbols) <= 20):
@@ -62,16 +194,57 @@ class DefaultKiaGateway:
         )
 
         quotes: list[MarketQuote] = []
-        for item in raw.get("quotes", []):
+        for index, item in enumerate(raw.get("quotes", [])):
             if not isinstance(item, dict):
                 continue
+            requested_symbol = req.symbols[index] if index < len(req.symbols) else ""
+            resolved_symbol = _resolve_symbol(
+                item.get("symbol", item.get("stk_cd", item.get("code", item.get("pdno", "")))),
+                fallback=requested_symbol,
+            )
             price_value = item.get("cur_prc", item.get("price", "0"))
+            try:
+                normalized_price = _parse_non_negative_price(price_value)
+            except (InvalidOperation, ValueError):
+                _LOGGER.warning(
+                    "Invalid batch quote price format: cycle_id=%s symbol=%s raw_cur_prc=%s raw_price=%s mode=%s",
+                    req.poll_cycle_id,
+                    resolved_symbol,
+                    item.get("cur_prc"),
+                    item.get("price"),
+                    req.mode,
+                )
+                normalized_price = Decimal("0")
+
+            if _is_negative_signed_price_text(item.get("cur_prc")) or _is_negative_signed_price_text(item.get("price")):
+                _LOGGER.warning(
+                    "Signed batch quote price detected: cycle_id=%s symbol=%s raw_cur_prc=%s raw_price=%s normalized=%s mode=%s",
+                    req.poll_cycle_id,
+                    resolved_symbol,
+                    item.get("cur_prc"),
+                    item.get("price"),
+                    format(normalized_price, "f"),
+                    req.mode,
+                )
+
             quotes.append(
                 MarketQuote(
-                    symbol=str(item.get("symbol", "")),
-                    price=Decimal(str(price_value)),
+                    symbol=resolved_symbol,
+                    price=normalized_price,
                     tick_size=int(item.get("tick_size", 1)),
                     as_of=_parse_dt(item.get("as_of")),
+                    symbol_name=_resolve_symbol_name(
+                        item.get(
+                            "symbol_name",
+                            item.get(
+                                "name",
+                                item.get(
+                                    "stk_nm",
+                                    item.get("hts_kor_isnm", item.get("prdt_abrv_name", item.get("isu_nm"))),
+                                ),
+                            ),
+                        )
+                    ),
                 )
             )
 

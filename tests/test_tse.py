@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import sys
@@ -24,7 +24,7 @@ from tse.models import PositionUpdateEvent, QuoteEvent
 
 
 def _dt(hour: int, minute: int = 0, second: int = 0) -> datetime:
-    return datetime(2026, 2, 17, hour, minute, second, tzinfo=timezone.utc)
+    return datetime(2026, 2, 17, hour, minute, second, tzinfo=timezone(timedelta(hours=9)))
 
 
 def test_rule_thresholds_with_eps() -> None:
@@ -106,6 +106,7 @@ def test_buy_transition_with_reference_drop_rebound() -> None:
     command = output.commands[0]
     assert command.symbol == "005930"
     assert command.reason_code == "TSE_REBOUND_BUY_SIGNAL"
+    assert command.order_price == Decimal("101.198")
     assert service.ctx.portfolio.active_symbol == "005930"
     assert service.ctx.portfolio.gate_open is False
 
@@ -164,6 +165,7 @@ def test_single_position_constraint_first_match_only() -> None:
 
     assert len(first.commands) == 1
     assert first.commands[0].symbol == "005930"
+    assert first.commands[0].order_price == Decimal("101.2")
     assert second.commands == []
 
 

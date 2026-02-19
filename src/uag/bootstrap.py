@@ -171,14 +171,74 @@ def create_app(
       const raw = document.getElementById('reportDate').value.trim();
       return raw || new Date().toISOString().slice(0, 10);
     }
+    const previousCurrentPriceByTbody = new Map();
+
+    function normalizePriceValue(value) {
+      if (value == null) {
+        return null;
+      }
+      const text = String(value).trim();
+      if (!text || text === '-') {
+        return null;
+      }
+      const parsed = Number(text.replace(/,/g, ''));
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+      return text;
+    }
+
+    function comparePriceChange(previousValue, currentValue) {
+      const prev = normalizePriceValue(previousValue);
+      const curr = normalizePriceValue(currentValue);
+
+      if (prev == null || curr == null) {
+        return null;
+      }
+      if (typeof prev === 'number' && typeof curr === 'number') {
+        if (curr > prev) {
+          return 1;
+        }
+        if (curr < prev) {
+          return -1;
+        }
+        return 0;
+      }
+      return String(prev) === String(curr) ? 0 : null;
+    }
+
+    function applyCurrentPriceHighlight(td, delta) {
+      if (delta == null) {
+        td.style.color = 'black';
+        td.style.fontWeight = 'normal';
+        return;
+      }
+
+      if (delta > 0) {
+        td.style.color = 'red';
+        td.style.fontWeight = 'normal';
+      } else if (delta < 0) {
+        td.style.color = 'blue';
+        td.style.fontWeight = 'normal';
+      } else {
+        td.style.color = '#444444';
+        td.style.fontWeight = 'normal';
+      }
+    }
+
     function display(value) {
       return value == null ? '-' : String(value);
     }
     function renderRows(tbodyId, rows) {
       const tbody = document.getElementById(tbodyId);
       tbody.innerHTML = '';
+      if (!previousCurrentPriceByTbody.has(tbodyId)) {
+        previousCurrentPriceByTbody.set(tbodyId, new Map());
+      }
+      const previousCurrentPriceBySymbol = previousCurrentPriceByTbody.get(tbodyId);
       for (const row of (rows || [])) {
         const tr = document.createElement('tr');
+        const symbolKey = String(row.symbolCode || row.symbolName || '');
         const cells = [
           display(row.symbolName),
           display(row.symbolCode),
@@ -193,11 +253,17 @@ def create_app(
           display(row.sellTime),
           display(row.sellPrice),
         ];
-        for (const text of cells) {
+        for (const [index, text] of cells.entries()) {
           const td = document.createElement('td');
           td.textContent = text;
+          if (index === 3) {
+            const previousValue = previousCurrentPriceBySymbol.get(symbolKey);
+            const delta = comparePriceChange(previousValue, row.currentPrice);
+            applyCurrentPriceHighlight(td, delta);
+          }
           tr.appendChild(td);
         }
+        previousCurrentPriceBySymbol.set(symbolKey, row.currentPrice);
         tbody.appendChild(tr);
       }
     }

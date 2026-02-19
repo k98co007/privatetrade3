@@ -17,7 +17,7 @@
 LLD-OPM의 주문/체결/포지션 책임을 실제 코드 단위로 구체화한다.
 
 - 주문 수명주기 상태머신 및 상태 전이 핸들러 구현
-- 매도 지정가 계산(현재가-2틱) 유틸 함수 구현
+- 매수/매도 지정가 계산(현재가+2틱, 현재가-2틱) 유틸 함수 구현
 - 체결 멱등 처리 및 주문 정합(Reconciliation) 알고리즘 구현
 - PRP 이벤트/스냅샷 저장 오케스트레이션 구현
 - 복구 모드 진입/해제 및 신규 주문 차단 가드 구현
@@ -42,7 +42,7 @@ src/
       enums.py                    # OrderStatus, PositionState, ReconcileState
       models.py                   # OrderAggregate, PositionModel, ExecutionFill
       state_machine.py            # 상태 전이 검증기 + 전이 함수
-      tick_rules.py               # KOSPI tick resolver, align, sell price calc
+    tick_rules.py               # KOSPI tick resolver, align, buy/sell price calc
       calculators.py              # qty/pnl/fee/tax 계산 유틸
       idempotency.py              # clientOrderId, executionId ledger
 

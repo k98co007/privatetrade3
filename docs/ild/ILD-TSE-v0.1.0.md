@@ -284,7 +284,7 @@ def should_emit_sell_signal(
 4) `buy_entry_blocked_by_degraded=True`이면 신규 BUY 진입 판단은 건너뛰고 종료
 5) `dropRate` 계산 후 1.0% 이상이면 `BUY_CANDIDATE` 진입 또는 `local_low` 갱신
 6) `BUY_CANDIDATE` 상태에서 `reboundRate` 계산 후 0.2% 이상이면 스케줄러 큐 등록
-7) 스케줄러가 선택한 1건에 대해 게이트 원자 획득 시 `PlaceBuyOrderCommand` 발행
+7) 스케줄러가 선택한 1건에 대해 게이트 원자 획득 시 `PlaceBuyOrderCommand` 발행 (`order_price = 현재가 + 2틱`)
 8) 발행 성공 시 `BUY_TRIGGERED` 및 포트폴리오 `BUY_REQUESTED`, 게이트 `CLOSED`
 9) 미선정/게이트 획득 실패 종목은 `BUY_BLOCKED`
 
@@ -508,6 +508,7 @@ def make_sell_command(position: PositionUpdateEvent) -> PlaceSellOrderCommand: .
 
 매핑 규칙:
 - BUY `reasonCode = "TSE_REBOUND_BUY_SIGNAL"`
+- BUY `order_price = add_ticks(current_price, 2)` (틱 경계 보장을 위해 1틱씩 2회 가산)
 - SELL `reasonCode = "TSE_PROFIT_PRESERVATION_BREAK"`
 - `commandId`는 `tradingDate-symbol-side-seq` 포맷으로 결정적 생성
 

@@ -15,7 +15,7 @@ if str(SRC) not in sys.path:
 
 from opm.models import ExecutionFill, create_empty_position
 from opm.service import OpmService
-from opm.tick_rules import compute_sell_limit_price
+from opm.tick_rules import compute_buy_limit_price, compute_sell_limit_price
 from prp.bootstrap import run_migrations
 from prp.repository import PrpRepository
 
@@ -34,6 +34,11 @@ def _repo() -> PrpRepository:
 def test_sell_price_computation_with_simplified_kospi_tick() -> None:
     assert compute_sell_limit_price(Decimal("71000")) == Decimal("70800")
     assert compute_sell_limit_price(Decimal("9980")) == Decimal("9960")
+
+
+def test_buy_price_computation_with_plus_two_ticks() -> None:
+    assert compute_buy_limit_price(Decimal("71000")) == Decimal("71200")
+    assert compute_buy_limit_price(Decimal("4995")) == Decimal("5010")
 
 
 def test_order_lifecycle_transition_guard() -> None:

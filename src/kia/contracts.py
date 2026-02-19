@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Literal, Protocol
 
 Mode = Literal["mock", "live"]
-ServiceType = Literal["auth", "quote", "order", "execution"]
+ServiceType = Literal["auth", "quote", "chart", "order", "execution"]
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,7 @@ class MarketQuote:
     price: Decimal
     tick_size: int
     as_of: datetime
+    symbol_name: str | None = None
 
 
 @dataclass(frozen=True)

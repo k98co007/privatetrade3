@@ -206,10 +206,13 @@ stateDiagram-v2
   "side": "BUY",
   "budgetPolicy": "ALL_IN",
   "signalPrice": 70630.00,
+  "orderPrice": 70830.00,
   "reasonCode": "TSE_REBOUND_BUY_SIGNAL",
   "requestedAt": "2026-02-17T09:05:10+09:00"
 }
 ```
+
+- BUY 주문 가격 규칙: `orderPrice = currentPrice`에서 시작해 호가단위를 1틱씩 2회 가산한 값(`현재가+2틱`)
 
 ### PlaceSellOrderCommand
 
@@ -413,7 +416,8 @@ function onQuote(quote):
     reboundRate = ((quote.currentPrice - symbolState.localLow) / symbolState.localLow) * 100
     if reboundRate >= 0.2:
       if tryAcquireGlobalBuyGate(ctx, quote.symbol):
-        opm.placeBuyOrder(allInCommand(quote))
+        buyOrderPrice = addTicks(quote.currentPrice, 2)
+        opm.placeBuyOrder(allInCommand(quote, buyOrderPrice))
         prp.saveStrategyEvent(BUY_SIGNAL)
       else:
         symbolState.state = BUY_BLOCKED
@@ -455,6 +459,7 @@ function onPositionUpdate(position):
 - TP-004: `BUY_CANDIDATE` 상태에서 더 낮은 가격 입력 시 `localLow`가 즉시 갱신되어야 한다.
 - TP-005: 반등률이 정확히 +0.2%일 때 `BUY_SIGNAL`이 발생해야 한다.
 - TP-006: 20개 종목 동시 감시에서 최초 충족 1건만 BUY 명령이 발생해야 한다.
+- TP-006-1: BUY 명령의 `orderPrice`는 신호 시점 현재가 대비 정확히 +2틱이어야 한다.
 - TP-007: `BUY_REQUESTED` 이후 다른 종목 신호는 모두 차단되어야 한다(노-더블-바이).
 - TP-008: 매수 후 수익률 +1.0% 도달 시 `MIN_PROFIT_LOCKED`가 1회만 발생해야 한다.
 - TP-009: `profitPreservationRate`가 정확히 80.0일 때 `SELL_SIGNAL`이 발생해야 한다.

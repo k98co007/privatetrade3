@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import sys
@@ -32,7 +32,7 @@ def _quote(symbol: str, price: str, hour: int, minute: int, second: int) -> Mark
         symbol=symbol,
         price=Decimal(price),
         tick_size=1,
-        as_of=datetime(2026, 2, 17, hour, minute, second, tzinfo=timezone.utc),
+        as_of=datetime(2026, 2, 17, hour, minute, second, tzinfo=timezone(timedelta(hours=9))),
     )
 
 
