@@ -14,7 +14,7 @@
 
 `TSE`는 전략 판정 전용 모듈로서, 시세/포지션 입력을 상태머신으로 해석하여 매수/매도 신호를 생성한다.
 
-- 09:03 기준가 1회 확정 (SRS FR-002)
+- 08:30 기준가 1회 확정 (SRS FR-002)
 - 기준가 대비 1% 하락 감지 및 매수 후보 전환 (SRS FR-003)
 - 후보 상태에서 전저점 지속 추적 (SRS FR-004)
 - 전저점 대비 0.2% 반등 매수 신호 판정 (SRS FR-005)
@@ -70,7 +70,7 @@
 
 ## 2.1 고정 파라미터(v0.1.0)
 
-- `REFERENCE_CAPTURE_TIME = 09:03:00` (로컬 서버 시각)
+- `REFERENCE_CAPTURE_TIME = 08:30:00` (로컬 서버 시각)
 - `DROP_THRESHOLD_PCT = 1.0`
 - `REBOUND_THRESHOLD_PCT = 0.2`
 - `MIN_PROFIT_LOCK_PCT = 1.0`
@@ -94,7 +94,7 @@
 ## 3.1 종목 단위 상태머신 (매수 전)
 
 상태 정의:
-- `WAIT_REFERENCE`: 09:03 기준가 확정 대기
+- `WAIT_REFERENCE`: 08:30 기준가 확정 대기
 - `TRACKING`: 기준가 확정 후 일반 감시
 - `BUY_CANDIDATE`: 1% 이상 하락 감지 후 전저점 추적
 - `BUY_TRIGGERED`: 0.2% 반등 조건 충족(전역 게이트 승인이 필요)
@@ -103,7 +103,7 @@
 ```mermaid
 stateDiagram-v2
   [*] --> WAIT_REFERENCE
-  WAIT_REFERENCE --> TRACKING: 09:03 기준가 저장
+  WAIT_REFERENCE --> TRACKING: 08:30 기준가 저장
   TRACKING --> BUY_CANDIDATE: dropRate >= 1.0%
   BUY_CANDIDATE --> BUY_CANDIDATE: currentPrice < localLow / localLow 갱신
   BUY_CANDIDATE --> BUY_TRIGGERED: currentPrice >= localLow*(1+0.2%)
@@ -113,7 +113,7 @@ stateDiagram-v2
 ```
 
 전이 규칙:
-- 09:03 이전에는 어떤 하락/반등 신호도 평가하지 않는다.
+- 08:30 이전에는 어떤 하락/반등 신호도 평가하지 않는다.
 - `BUY_CANDIDATE` 진입 시 `localLow = currentPrice`로 초기화한다.
 - `BUY_CANDIDATE` 동안 더 낮은 가격이 나오면 즉시 `localLow`를 갱신한다.
 - 반등 판정은 항상 최신 `localLow`를 기준으로 계산한다.
@@ -157,7 +157,7 @@ stateDiagram-v2
 
 - 감시 대상 종목 수는 1~20개 범위여야 한다.
 - 기준가 캡처는 거래일당 종목별 1회만 허용한다.
-- 09:03 이전(`HH:MM:SS < 09:03:00`)에는 매수 상태머신을 진행하지 않는다.
+- 08:30 이전(`HH:MM:SS < 08:30:00`)에는 매수 상태머신을 진행하지 않는다.
 - 거래일 경계(날짜 변경) 시 모든 종목 상태와 전역 게이트를 초기화한다.
 - `BUY_REQUESTED` 이후 같은 거래일에는 추가 매수 신호를 발행하지 않는다.
 - 매수 실패(거부/취소/미체결 만료)가 확정되면 전역 게이트를 재개방하여 재탐색을 허용한다.
@@ -259,7 +259,7 @@ stateDiagram-v2
 
 ## 7. 엣지 케이스
 
-- 기준가 미확정: 09:03 시세 누락 시, 첫 유효 시세 도착 시점에 기준가를 확정하고 `REFERENCE_CAPTURE_DELAYED` 이벤트 기록
+- 기준가 미확정: 08:30 시세 누락 시, 첫 유효 시세 도착 시점에 기준가를 확정하고 `REFERENCE_CAPTURE_DELAYED` 이벤트 기록
 - 기준가 0/음수: 해당 틱 무시 + 검증 오류 이벤트 기록
 - 갭하락 후 즉시 반등: 1틱 내 `drop>=1%`와 `rebound>=0.2%`가 연쇄 충족되어도 상태 전이 순서를 유지해 단일 BUY만 허용
 - 초고빈도 하락: `localLow`는 항상 최소값으로만 단조 감소 갱신
@@ -279,7 +279,7 @@ function runQuotePollingLoop(ctx):
   consecutiveSuccess = 0
 
   while ctx.loopState != STOPPED:
-    if now() < 09:03:00:
+    if now() < 08:30:00:
       sleep(quotePollIntervalMs)
       continue
 
@@ -381,14 +381,14 @@ function runQuoteMonitoringLoop(ctx):
 - 모든 종목 실패가 연속 임계치를 넘으면 `DEGRADED`로 전환한다.
 - `DEGRADED` 중에도 포지션 보유 시 매도 관련 입력(`onPositionUpdate`)은 유지한다.
 
-## 8.1 09:03 기준가 캡처 및 매수 전 판정
+## 8.1 08:30 기준가 캡처 및 매수 전 판정
 
 ```text
 function onQuote(quote):
   ctx = getDailyContext(quote.tradingDate)
   symbolState = ctx.symbols[quote.symbol]
 
-  if quote.time < 09:03:00:
+  if quote.time < 08:30:00:
     return
 
   if symbolState.basePrice is null:
@@ -453,8 +453,8 @@ function onPositionUpdate(position):
 
 ## 9.1 기능 테스트
 
-- TP-001: 09:03 이전 시세는 상태 변화가 없어야 한다.
-- TP-002: 09:03 시점 종목별 기준가가 1회만 저장되어야 한다.
+- TP-001: 08:30 이전 시세는 상태 변화가 없어야 한다.
+- TP-002: 08:30 시점 종목별 기준가가 1회만 저장되어야 한다.
 - TP-003: 기준가 대비 정확히 -1.0%에서 `BUY_CANDIDATE` 진입해야 한다.
 - TP-004: `BUY_CANDIDATE` 상태에서 더 낮은 가격 입력 시 `localLow`가 즉시 갱신되어야 한다.
 - TP-005: 반등률이 정확히 +0.2%일 때 `BUY_SIGNAL`이 발생해야 한다.
@@ -467,7 +467,7 @@ function onPositionUpdate(position):
 
 ## 9.2 경계/예외 테스트
 
-- TP-011: 기준가 누락(09:03 틱 결손) 상황에서 지연 캡처가 동작해야 한다.
+- TP-011: 기준가 누락(08:30 틱 결손) 상황에서 지연 캡처가 동작해야 한다.
 - TP-012: `basePrice<=0` 또는 `localLow<=0` 입력 시 계산이 차단되어야 한다.
 - TP-013: 거래일 변경 시 상태가 초기화되고 전일 이벤트가 무시되어야 한다.
 - TP-014: 동일 타임스탬프 다중 BUY 트리거 시 우선순위 규칙(시각→시퀀스→목록순)이 유지되어야 한다.
@@ -481,7 +481,7 @@ function onPositionUpdate(position):
 
 | 요구사항 출처 | 요구 내용 | TSE 설계 반영 섹션 |
 |---|---|---|
-| HLD 4.2 | 09:03 기준가, 하락/반등 매수 판정 | 2장, 3.1, 8.1 |
+| HLD 4.2 | 08:30 기준가, 하락/반등 매수 판정 | 2장, 3.1, 8.1 |
 | HLD 4.2 | +1% 확보, 80% 보전율 매도 판정 | 3.3, 8.2 |
 | HLD 5.2 | TSE→OPM, TSE→PRP 계약 | 5장 |
 | SRS FR-002~FR-005 | 기준가/하락/전저점/반등 | 2장, 3.1, 8.1 |

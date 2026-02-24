@@ -6,7 +6,7 @@ import threading
 import time
 import logging
 from datetime import date, datetime, time as dt_time, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, cast
 
 from csm.errors import CsmValidationError
@@ -19,14 +19,14 @@ from opm.service import OpmService
 from prp.repository import PrpRepository
 from tse.constants import MIN_PROFIT_LOCK_PCT
 from tse.rules import calc_drop_rate, should_enter_buy_candidate
-from tse.models import PlaceBuyOrderCommand, PlaceSellOrderCommand
+from tse.models import PlaceBuyOrderCommand, PlaceSellOrderCommand, PositionUpdateEvent
 from tse.quote_monitoring import QuoteMonitoringConfig, QuoteMonitoringLoop
 from tse.service import TseService
 
 from .models import MonitoringSnapshot, RuntimeState
 
 
-REFERENCE_CAPTURE_TIME = dt_time(hour=9, minute=3, second=0)
+REFERENCE_CAPTURE_TIME = dt_time(hour=8, minute=30, second=0)
 MARKET_CLOSE_TIME = dt_time(hour=15, minute=30, second=0)
 MARKET_TIMEZONE = timezone(timedelta(hours=9))
 
@@ -53,12 +53,14 @@ class UagService:
         self.monitoring_state_path = monitoring_state_path
         self.state = RuntimeState()
         self._quote_loop: QuoteMonitoringLoop | None = None
+        self._tse_service: TseService | None = None
         self._quote_loop_thread: threading.Thread | None = None
         self._quote_loop_stop = threading.Event()
         self._quote_loop_lock = threading.Lock()
         self._order_gateway: DefaultKiaGateway | None = None
         self._ensure_runtime_files()
         self._restore_monitoring_state()
+        self._resume_trading_if_needed()
 
     def _ensure_runtime_files(self) -> None:
         os.makedirs(os.path.dirname(self.repository.settings_path), exist_ok=True)
@@ -120,7 +122,17 @@ class UagService:
             self.state.trading_date.isoformat(),
             dry_run,
         )
-        self._start_quote_monitoring_loop()
+        try:
+            self._start_quote_monitoring_loop()
+        except Exception:
+            self.state.engine_state = "IDLE"
+            self.state.trading_started_at = None
+            self.state.trading_date = None
+            self.state.quote_loop_state = "STOPPED"
+            self._logger.exception("Failed to start trading loop")
+            raise
+
+        self._persist_monitoring_state()
 
         return {
             "engineState": self.state.engine_state,
@@ -161,8 +173,41 @@ class UagService:
 
     def shutdown(self) -> None:
         self._logger.info("Shutdown requested: stopping quote monitoring loop")
-        self.state.engine_state = "IDLE"
+        was_running = self.state.engine_state == "RUNNING"
         self._stop_quote_monitoring_loop()
+        self.state.engine_state = "RUNNING" if was_running else "IDLE"
+        self._persist_monitoring_state()
+
+    def _resume_trading_if_needed(self) -> None:
+        if self.state.engine_state != "RUNNING":
+            return
+
+        if self.state.trading_date != date.today():
+            self.state.engine_state = "IDLE"
+            self.state.trading_started_at = None
+            self.state.trading_date = None
+            self._persist_monitoring_state()
+            return
+
+        self._logger.info(
+            "Auto-resuming trading engine from monitoring state: trading_date=%s dry_run=%s",
+            self.state.trading_date.isoformat() if self.state.trading_date else None,
+            self.state.dry_run,
+        )
+
+        try:
+            self._start_quote_monitoring_loop()
+        except Exception:
+            self.state.engine_state = "IDLE"
+            self.state.trading_started_at = None
+            self.state.trading_date = None
+            self.state.quote_loop_state = "STOPPED"
+            self.state.quote_last_cycle_error = "UAG_ENGINE_AUTO_RESUME_FAILED"
+            self._persist_monitoring_state()
+            self._logger.exception("Failed to auto-resume trading loop from monitoring state")
+            return
+
+        self._persist_monitoring_state()
 
     def get_daily_report(self, trading_date: date) -> dict[str, Any]:
         with PrpRepository(db_path=self.prp_db_path) as repo:
@@ -247,6 +292,7 @@ class UagService:
 
             self._quote_loop_stop.clear()
             tse_service = TseService(trading_date=self.state.trading_date or date.today(), watch_symbols=watch_symbols)
+            self._tse_service = tse_service
             self._order_gateway = DefaultKiaGateway(csm_repository=self.repository)
             self._initialize_reference_prices(
                 tse_service=tse_service,
@@ -295,20 +341,39 @@ class UagService:
             if symbol_ctx is None:
                 continue
 
-            if snapshot.price_at_0903 is not None and symbol_ctx.reference_price is None:
-                symbol_ctx.reference_price = snapshot.price_at_0903
-                symbol_ctx.state = "TRACKING"
+            buy_already_executed = snapshot.buy_time is not None
+
+            if snapshot.price_at_0830 is not None and symbol_ctx.reference_price is None:
+                symbol_ctx.reference_price = snapshot.price_at_0830
+                symbol_ctx.state = "BUY_BLOCKED" if buy_already_executed else "TRACKING"
+                if not snapshot.previous_low_tracking_started:
+                    snapshot.previous_low_time = None
+                    snapshot.previous_low_price = None
+
+            if buy_already_executed:
+                symbol_ctx.state = "BUY_BLOCKED"
+                symbol_ctx.tracked_low = None
+
+            if (
+                symbol_ctx.reference_price is not None
+                and not buy_already_executed
+                and snapshot.previous_low_tracking_started
+                and snapshot.previous_low_price is not None
+                and should_enter_buy_candidate(calc_drop_rate(symbol_ctx.reference_price, snapshot.previous_low_price))
+            ):
+                symbol_ctx.state = "BUY_CANDIDATE"
+                symbol_ctx.tracked_low = snapshot.previous_low_price
 
             if now_market < REFERENCE_CAPTURE_TIME:
                 continue
-            if snapshot.price_at_0903 is not None:
+            if snapshot.price_at_0830 is not None:
                 continue
 
             try:
-                reference_price = kia_gateway.fetch_reference_price_0903(mode=mode, symbol=symbol)
+                reference_price = kia_gateway.fetch_reference_price_0830(mode=mode, symbol=symbol)
             except Exception:
                 self._logger.exception(
-                    "Failed to backfill 09:03 reference price from Kiwoom: symbol=%s mode=%s",
+                    "Failed to backfill 08:30 reference price from Kiwoom: symbol=%s mode=%s",
                     symbol,
                     mode,
                 )
@@ -324,15 +389,45 @@ class UagService:
             )
             self._set_monitoring_field(
                 snapshot=snapshot,
-                field_name="price_at_0903",
+                field_name="price_at_0830",
                 value=reference_price,
-                source="QUOTE_REFERENCE_BACKFILL_0903",
+                source="QUOTE_REFERENCE_BACKFILL_0830",
                 occurred_at=occurred_at,
             )
 
             if symbol_ctx.reference_price is None:
                 symbol_ctx.reference_price = reference_price
-                symbol_ctx.state = "TRACKING"
+                symbol_ctx.state = "BUY_BLOCKED" if buy_already_executed else "TRACKING"
+                if not snapshot.previous_low_tracking_started:
+                    update_field = self._set_monitoring_field
+                    update_field(
+                        snapshot=snapshot,
+                        field_name="previous_low_time",
+                        value=None,
+                        source="REFERENCE_SET_RESET_PREVIOUS_LOW",
+                        occurred_at=occurred_at,
+                    )
+                    update_field(
+                        snapshot=snapshot,
+                        field_name="previous_low_price",
+                        value=None,
+                        source="REFERENCE_SET_RESET_PREVIOUS_LOW",
+                        occurred_at=occurred_at,
+                    )
+
+            if buy_already_executed:
+                symbol_ctx.state = "BUY_BLOCKED"
+                symbol_ctx.tracked_low = None
+
+            if (
+                symbol_ctx.reference_price is not None
+                and not buy_already_executed
+                and snapshot.previous_low_tracking_started
+                and snapshot.previous_low_price is not None
+                and should_enter_buy_candidate(calc_drop_rate(symbol_ctx.reference_price, snapshot.previous_low_price))
+            ):
+                symbol_ctx.state = "BUY_CANDIDATE"
+                symbol_ctx.tracked_low = snapshot.previous_low_price
 
     def _stop_quote_monitoring_loop(self) -> None:
         self._quote_loop_stop.set()
@@ -345,6 +440,7 @@ class UagService:
 
         self._quote_loop_thread = None
         self._quote_loop = None
+        self._tse_service = None
         self._order_gateway = None
         self.state.quote_loop_state = "STOPPED"
         self._logger.info("Quote loop stopped")
@@ -365,6 +461,7 @@ class UagService:
                 self._logger.exception("Quote loop crashed during run_cycle")
                 break
 
+            self._append_position_update_outputs(cycle)
             self._update_monitoring_snapshots(cycle)
             self.state.quote_loop_state = cycle.state
             self.state.quote_cycles_total += 1
@@ -377,26 +474,17 @@ class UagService:
             self.state.quote_last_command_count = sum(len(output.commands) for output in cycle.outputs)
             self.state.quote_last_strategy_event_count = sum(len(output.strategy_events) for output in cycle.outputs)
 
-            should_emit_cycle_info = (
-                cycle.partial
-                or cycle.fetch_error is not None
-                or cycle.error_count > 0
-                or cycle.quote_count == 0
-                or self.state.quote_last_command_count > 0
-                or (self.state.quote_cycles_total % 30 == 0)
+            self._logger.info(
+                "Quote cycle summary: cycle_id=%s state=%s partial=%s quotes=%s errors=%s commands=%s events=%s fetch_error=%s",
+                cycle.poll_cycle_id,
+                cycle.state,
+                cycle.partial,
+                cycle.quote_count,
+                cycle.error_count,
+                self.state.quote_last_command_count,
+                self.state.quote_last_strategy_event_count,
+                cycle.fetch_error,
             )
-            if should_emit_cycle_info:
-                self._logger.info(
-                    "Quote cycle summary: cycle_id=%s state=%s partial=%s quotes=%s errors=%s commands=%s events=%s fetch_error=%s",
-                    cycle.poll_cycle_id,
-                    cycle.state,
-                    cycle.partial,
-                    cycle.quote_count,
-                    cycle.error_count,
-                    self.state.quote_last_command_count,
-                    self.state.quote_last_strategy_event_count,
-                    cycle.fetch_error,
-                )
 
             if not self.state.dry_run:
                 self._execute_cycle_commands(cycle.outputs)
@@ -410,6 +498,58 @@ class UagService:
             if self._quote_loop_stop.is_set() or self.state.engine_state != "RUNNING":
                 break
             time.sleep(interval_seconds)
+
+    def _append_position_update_outputs(self, cycle: Any) -> None:
+        if self._tse_service is None or self.state.trading_date is None:
+            return
+
+        quote_by_symbol = {quote.symbol: quote for quote in getattr(cycle, "quotes", [])}
+
+        for symbol, snapshot in self.state.monitoring_snapshots.items():
+            if snapshot.buy_time is None or snapshot.buy_price is None:
+                continue
+            if snapshot.sell_time is not None:
+                continue
+            if snapshot.buy_price <= 0:
+                continue
+
+            quote = quote_by_symbol.get(symbol)
+            current_price = quote.price if quote is not None else snapshot.current_price
+            if current_price is None or current_price <= 0:
+                continue
+
+            max_price = snapshot.previous_high_price if snapshot.previous_high_price is not None else current_price
+            if current_price > max_price:
+                max_price = current_price
+
+            current_profit_rate = self._calc_profit_rate_pct(buy_price=snapshot.buy_price, target_price=current_price)
+            max_profit_rate = self._calc_profit_rate_pct(buy_price=snapshot.buy_price, target_price=max_price)
+            event_time = quote.as_of if quote is not None else datetime.now().astimezone()
+
+            output = self._tse_service.on_position_update(
+                PositionUpdateEvent(
+                    trading_date=self.state.trading_date,
+                    symbol=symbol,
+                    position_state="LONG_OPEN",
+                    avg_buy_price=snapshot.buy_price,
+                    current_price=current_price,
+                    current_profit_rate=current_profit_rate,
+                    max_profit_rate=max_profit_rate,
+                    min_profit_locked=current_profit_rate >= MIN_PROFIT_LOCK_PCT,
+                    updated_at=event_time,
+                )
+            )
+            if output.commands or output.strategy_events:
+                cycle.outputs.append(output)
+
+    @staticmethod
+    def _calc_profit_rate_pct(*, buy_price: Decimal, target_price: Decimal) -> Decimal:
+        if buy_price <= 0:
+            return Decimal("0")
+        return (((target_price - buy_price) / buy_price) * Decimal("100")).quantize(
+            Decimal("0.0001"),
+            rounding=ROUND_HALF_UP,
+        )
 
     def _execute_cycle_commands(self, outputs: list) -> None:
         command_count = sum(len(output.commands) for output in outputs)
@@ -555,15 +695,15 @@ class UagService:
         value: Any,
         source: str,
         occurred_at: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         before = getattr(snapshot, field_name)
         if before == value:
-            return
+            return False
 
         setattr(snapshot, field_name, value)
 
         if field_name in {"current_price", "current_price_at_close"}:
-            return
+            return True
 
         self._logger.info(
             "Monitor row updated: symbol=%s field=%s before=%s after=%s source=%s occurred_at=%s",
@@ -574,6 +714,7 @@ class UagService:
             source,
             occurred_at.isoformat() if occurred_at else None,
         )
+        return True
 
     @staticmethod
     def _format_monitoring_value(value: Any) -> str:
@@ -586,12 +727,20 @@ class UagService:
         return str(value)
 
     def _update_monitoring_snapshots(self, cycle: Any) -> None:
+        should_persist = False
+
+        def update_field(*, persist_on_change: bool = True, **kwargs: Any) -> None:
+            nonlocal should_persist
+            changed = self._set_monitoring_field(**kwargs)
+            if changed and persist_on_change:
+                should_persist = True
+
         for quote in cycle.quotes:
             snapshot = self._snapshot_for_symbol(quote.symbol)
             quote_time = quote.as_of
             quote_symbol_name = str(getattr(quote, "symbol_name", "") or "").strip()
             if quote_symbol_name and quote_symbol_name != snapshot.symbol_name:
-                self._set_monitoring_field(
+                update_field(
                     snapshot=snapshot,
                     field_name="symbol_name",
                     value=quote_symbol_name,
@@ -611,34 +760,62 @@ class UagService:
                 )
                 continue
 
-            if snapshot.price_at_0903 is None and market_time >= REFERENCE_CAPTURE_TIME:
-                self._set_monitoring_field(
+            if snapshot.price_at_0830 is None and market_time >= REFERENCE_CAPTURE_TIME:
+                update_field(
                     snapshot=snapshot,
-                    field_name="price_at_0903",
+                    field_name="price_at_0830",
                     value=quote_price,
                     source="QUOTE_REFERENCE_CAPTURE",
                     occurred_at=quote_time,
                 )
 
-            self._set_monitoring_field(
+            update_field(
                 snapshot=snapshot,
                 field_name="current_price",
                 value=quote_price,
                 source="QUOTE_TICK",
                 occurred_at=quote_time,
+                persist_on_change=False,
             )
 
-            if snapshot.buy_time is None and (
-                snapshot.previous_low_price is None or quote_price <= snapshot.previous_low_price
+            can_start_previous_low_tracking = (
+                snapshot.price_at_0830 is not None
+                and should_enter_buy_candidate(calc_drop_rate(snapshot.price_at_0830, quote_price))
+            )
+
+            if snapshot.buy_time is None and not snapshot.previous_low_tracking_started and can_start_previous_low_tracking:
+                update_field(
+                    snapshot=snapshot,
+                    field_name="previous_low_tracking_started",
+                    value=True,
+                    source="QUOTE_PREVIOUS_LOW_TRACKING_START",
+                    occurred_at=quote_time,
+                )
+                update_field(
+                    snapshot=snapshot,
+                    field_name="previous_low_price",
+                    value=quote_price,
+                    source="QUOTE_PREVIOUS_LOW_TRACKING_START",
+                    occurred_at=quote_time,
+                )
+                update_field(
+                    snapshot=snapshot,
+                    field_name="previous_low_time",
+                    value=quote_time,
+                    source="QUOTE_PREVIOUS_LOW_TRACKING_START",
+                    occurred_at=quote_time,
+                )
+            elif snapshot.buy_time is None and snapshot.previous_low_tracking_started and (
+                snapshot.previous_low_price is None or quote_price < snapshot.previous_low_price
             ):
-                self._set_monitoring_field(
+                update_field(
                     snapshot=snapshot,
                     field_name="previous_low_price",
                     value=quote_price,
                     source="QUOTE_PREVIOUS_LOW",
                     occurred_at=quote_time,
                 )
-                self._set_monitoring_field(
+                update_field(
                     snapshot=snapshot,
                     field_name="previous_low_time",
                     value=quote_time,
@@ -650,15 +827,15 @@ class UagService:
                 snapshot=snapshot,
                 quote_time=quote_time,
                 quote_price=quote_price,
-            ) and (snapshot.previous_high_price is None or quote_price >= snapshot.previous_high_price):
-                self._set_monitoring_field(
+            ) and (snapshot.previous_high_price is None or quote_price > snapshot.previous_high_price):
+                update_field(
                     snapshot=snapshot,
                     field_name="previous_high_price",
                     value=quote_price,
                     source="QUOTE_PREVIOUS_HIGH",
                     occurred_at=quote_time,
                 )
-                self._set_monitoring_field(
+                update_field(
                     snapshot=snapshot,
                     field_name="previous_high_time",
                     value=quote_time,
@@ -667,7 +844,7 @@ class UagService:
                 )
 
             if snapshot.current_price_at_close is None and market_time >= MARKET_CLOSE_TIME:
-                self._set_monitoring_field(
+                update_field(
                     snapshot=snapshot,
                     field_name="current_price_at_close",
                     value=quote_price,
@@ -687,28 +864,28 @@ class UagService:
             for command in output.commands:
                 snapshot = self._snapshot_for_symbol(command.symbol)
                 if isinstance(command, PlaceBuyOrderCommand):
-                    self._set_monitoring_field(
+                    update_field(
                         snapshot=snapshot,
                         field_name="buy_time",
                         value=buy_signal_times.get(command.symbol, datetime.now().astimezone()),
                         source="BUY_COMMAND",
                         occurred_at=buy_signal_times.get(command.symbol),
                     )
-                    self._set_monitoring_field(
+                    update_field(
                         snapshot=snapshot,
                         field_name="buy_price",
                         value=command.order_price,
                         source="BUY_COMMAND",
                         occurred_at=buy_signal_times.get(command.symbol),
                     )
-                    self._set_monitoring_field(
+                    update_field(
                         snapshot=snapshot,
                         field_name="previous_high_time",
                         value=None,
                         source="BUY_COMMAND_RESET_PREVIOUS_HIGH",
                         occurred_at=buy_signal_times.get(command.symbol),
                     )
-                    self._set_monitoring_field(
+                    update_field(
                         snapshot=snapshot,
                         field_name="previous_high_price",
                         value=None,
@@ -716,14 +893,14 @@ class UagService:
                         occurred_at=buy_signal_times.get(command.symbol),
                     )
                 elif isinstance(command, PlaceSellOrderCommand):
-                    self._set_monitoring_field(
+                    update_field(
                         snapshot=snapshot,
                         field_name="sell_time",
                         value=sell_signal_times.get(command.symbol, datetime.now().astimezone()),
                         source="SELL_COMMAND",
                         occurred_at=sell_signal_times.get(command.symbol),
                     )
-                    self._set_monitoring_field(
+                    update_field(
                         snapshot=snapshot,
                         field_name="sell_price",
                         value=command.order_price,
@@ -731,7 +908,8 @@ class UagService:
                         occurred_at=sell_signal_times.get(command.symbol),
                     )
 
-        self._persist_monitoring_state()
+        if should_persist:
+            self._persist_monitoring_state()
 
     def _restore_monitoring_state(self) -> None:
         if not os.path.exists(self.monitoring_state_path):
@@ -770,9 +948,10 @@ class UagService:
                 restored[symbol] = MonitoringSnapshot(
                     symbol_code=str(raw_snapshot.get("symbolCode", symbol)),
                     symbol_name=str(raw_snapshot.get("symbolName", symbol)),
-                    price_at_0903=self._deserialize_decimal(raw_snapshot.get("priceAt0903")),
+                    price_at_0830=self._deserialize_decimal(raw_snapshot.get("priceAt0830")),
                     current_price=self._deserialize_decimal(raw_snapshot.get("currentPrice")),
                     current_price_at_close=self._deserialize_decimal(raw_snapshot.get("currentPriceAtClose")),
+                    previous_low_tracking_started=bool(raw_snapshot.get("previousLowTrackingStarted", False)),
                     previous_low_time=self._deserialize_datetime(raw_snapshot.get("previousLowTime")),
                     previous_low_price=self._deserialize_decimal(raw_snapshot.get("previousLowPrice")),
                     buy_time=self._deserialize_datetime(raw_snapshot.get("buyTime")),
@@ -787,24 +966,39 @@ class UagService:
 
         self.state.monitoring_snapshots = restored
         self.state.trading_date = stored_trading_date
+        engine_state_raw = payload.get("engineState")
+        if engine_state_raw in {"IDLE", "RUNNING"}:
+            self.state.engine_state = engine_state_raw
+
+        dry_run_raw = payload.get("dryRun")
+        if isinstance(dry_run_raw, bool):
+            self.state.dry_run = dry_run_raw
+
+        trading_started_at_raw = payload.get("tradingStartedAt")
+        self.state.trading_started_at = self._deserialize_datetime(trading_started_at_raw)
         self._logger.info(
-            "Monitoring state restored: trading_date=%s symbols=%s",
+            "Monitoring state restored: trading_date=%s symbols=%s engine_state=%s",
             stored_trading_date.isoformat(),
             len(restored),
+            self.state.engine_state,
         )
 
     def _persist_monitoring_state(self) -> None:
         trading_date_value = self.state.trading_date or date.today()
         payload = {
             "tradingDate": trading_date_value.isoformat(),
+            "engineState": self.state.engine_state,
+            "tradingStartedAt": self._serialize_datetime(self.state.trading_started_at),
+            "dryRun": self.state.dry_run,
             "updatedAt": datetime.now().astimezone().isoformat(),
             "snapshots": {
                 symbol: {
                     "symbolCode": snapshot.symbol_code,
                     "symbolName": snapshot.symbol_name,
-                    "priceAt0903": self._serialize_decimal(snapshot.price_at_0903),
+                    "priceAt0830": self._serialize_decimal(snapshot.price_at_0830),
                     "currentPrice": self._serialize_decimal(snapshot.current_price),
                     "currentPriceAtClose": self._serialize_decimal(snapshot.current_price_at_close),
+                    "previousLowTrackingStarted": snapshot.previous_low_tracking_started,
                     "previousLowTime": self._serialize_datetime(snapshot.previous_low_time),
                     "previousLowPrice": self._serialize_decimal(snapshot.previous_low_price),
                     "buyTime": self._serialize_datetime(snapshot.buy_time),
@@ -817,12 +1011,79 @@ class UagService:
                 for symbol, snapshot in self.state.monitoring_snapshots.items()
             },
         }
+        payload = self._merge_with_existing_monitoring_state(payload)
 
         try:
-            with open(self.monitoring_state_path, "w", encoding="utf-8") as handle:
+            temp_path = f"{self.monitoring_state_path}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False)
+            os.replace(temp_path, self.monitoring_state_path)
         except OSError:
             self._logger.warning("Failed to persist monitoring state file: path=%s", self.monitoring_state_path)
+
+    def _merge_with_existing_monitoring_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not os.path.exists(self.monitoring_state_path):
+            return payload
+
+        try:
+            with open(self.monitoring_state_path, "r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return payload
+
+        if not isinstance(existing, dict):
+            return payload
+        if existing.get("tradingDate") != payload.get("tradingDate"):
+            return payload
+
+        existing_snapshots = existing.get("snapshots")
+        next_snapshots = payload.get("snapshots")
+        if not isinstance(existing_snapshots, dict) or not isinstance(next_snapshots, dict):
+            return payload
+
+        merged = dict(next_snapshots)
+        for symbol, existing_row in existing_snapshots.items():
+            if not isinstance(existing_row, dict):
+                continue
+
+            next_row_raw = merged.get(symbol)
+            if not isinstance(next_row_raw, dict):
+                merged[symbol] = existing_row
+                continue
+
+            next_row = dict(next_row_raw)
+            buy_time_changed = (
+                next_row.get("buyTime") is not None
+                and next_row.get("buyTime") != existing_row.get("buyTime")
+            )
+
+            preserve_if_empty_fields = [
+                "priceAt0830",
+                "previousLowTime",
+                "previousLowPrice",
+                "buyTime",
+                "buyPrice",
+                "sellTime",
+                "sellPrice",
+                "currentPriceAtClose",
+            ]
+            for field_name in preserve_if_empty_fields:
+                if next_row.get(field_name) is None and existing_row.get(field_name) is not None:
+                    next_row[field_name] = existing_row.get(field_name)
+
+            if not next_row.get("previousLowTrackingStarted", False) and bool(existing_row.get("previousLowTrackingStarted", False)):
+                next_row["previousLowTrackingStarted"] = True
+
+            if not buy_time_changed:
+                if next_row.get("previousHighTime") is None and existing_row.get("previousHighTime") is not None:
+                    next_row["previousHighTime"] = existing_row.get("previousHighTime")
+                if next_row.get("previousHighPrice") is None and existing_row.get("previousHighPrice") is not None:
+                    next_row["previousHighPrice"] = existing_row.get("previousHighPrice")
+
+            merged[symbol] = next_row
+
+        payload["snapshots"] = merged
+        return payload
 
     def _delete_monitoring_state_file(self) -> None:
         try:
@@ -878,10 +1139,7 @@ class UagService:
                 current_price = snapshot.current_price
 
             previous_low_price = snapshot.previous_low_price
-            previous_low_is_tracked = False
-            if previous_low_price is not None and snapshot.price_at_0903 is not None:
-                drop_rate = calc_drop_rate(snapshot.price_at_0903, previous_low_price)
-                previous_low_is_tracked = should_enter_buy_candidate(drop_rate)
+            previous_low_is_tracked = snapshot.previous_low_tracking_started and previous_low_price is not None
 
             if not previous_low_is_tracked:
                 previous_low_price = None
@@ -906,7 +1164,7 @@ class UagService:
                 {
                     "symbolName": snapshot.symbol_name,
                     "symbolCode": snapshot.symbol_code,
-                    "priceAt0903": to_decimal_string(snapshot.price_at_0903) if snapshot.price_at_0903 is not None else None,
+                    "priceAt0830": to_decimal_string(snapshot.price_at_0830) if snapshot.price_at_0830 is not None else None,
                     "currentPrice": to_decimal_string(current_price) if current_price is not None else None,
                     "previousLowTime": self._format_hms(previous_low_time),
                     "previousLowPrice": to_decimal_string(previous_low_price) if previous_low_price is not None else None,

@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal
 
-from opm.tick_rules import compute_buy_limit_price
+from opm.tick_rules import compute_buy_limit_price, resolve_kospi_tick_size
 
-from .constants import MAX_WATCH_SYMBOLS, REFERENCE_CAPTURE_TIME
+from .constants import MAX_WATCH_SYMBOLS, REBOUND_THRESHOLD_PCT, REFERENCE_CAPTURE_TIME
 from .models import (
     DailyContext,
     PlaceBuyOrderCommand,
@@ -82,6 +82,11 @@ class TseService:
         symbol_ctx = self.ctx.symbols[event.symbol]
         symbol_ctx.last_quote_at = event.occurred_at
         symbol_ctx.last_sequence = event.sequence
+
+        if symbol_ctx.state == "BUY_BLOCKED":
+            if symbol_ctx.reference_price is None:
+                symbol_ctx.reference_price = event.current_price
+            return output
 
         if symbol_ctx.reference_price is None:
             symbol_ctx.reference_price = event.current_price
@@ -203,7 +208,10 @@ class TseService:
             )
 
         rebound_rate = calc_rebound_rate(symbol_ctx.tracked_low, event.current_price)
-        if should_trigger_rebound_buy(rebound_rate):
+        if should_trigger_rebound_buy(rebound_rate) and self._is_within_rebound_entry_price_band(
+            tracked_low=symbol_ctx.tracked_low,
+            current_price=event.current_price,
+        ):
             self.scheduler.enqueue_candidate(
                 occurred_at=event.occurred_at,
                 sequence=event.sequence,
@@ -252,3 +260,10 @@ class TseService:
     def _next_command_id(self, trading_date: date, symbol: str, side: str) -> str:
         self._command_sequence += 1
         return f"{trading_date.isoformat()}-{symbol}-{side}-{self._command_sequence}"
+
+    @staticmethod
+    def _is_within_rebound_entry_price_band(*, tracked_low: Decimal, current_price: Decimal) -> bool:
+        trigger_price = tracked_low * (Decimal("1") + (REBOUND_THRESHOLD_PCT / Decimal("100")))
+        tick = resolve_kospi_tick_size(trigger_price)
+        max_allowed_price = trigger_price + (tick * Decimal("2"))
+        return current_price < max_allowed_price

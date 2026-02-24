@@ -51,7 +51,7 @@
 
 ```json
 {
-  "dmst_stex_tp": "KRX",
+  "dmst_stex_tp": "SOR",
   "stk_cd": "005930",
   "ord_qty": "1",
   "ord_uv": "",
@@ -100,7 +100,7 @@ def fn_kt10000(token, data, cont_yn='N', next_key=''):
 if __name__ == '__main__':
     MY_ACCESS_TOKEN = '사용자 AccessToken'
     params = {
-        'dmst_stex_tp': 'KRX',
+      'dmst_stex_tp': 'SOR',
         'stk_cd': '005930',
         'ord_qty': '1',
         'ord_uv': '',

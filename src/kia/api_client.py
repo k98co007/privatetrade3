@@ -23,6 +23,19 @@ TransportFn = Callable[
     tuple[int, dict[str, Any]],
 ]
 
+_SOR_STOCK_SUFFIX = "_AL"
+
+
+def _to_quote_sor_symbol(symbol: str) -> str:
+    normalized = str(symbol).strip()
+    if not normalized:
+        return normalized
+    if normalized.endswith(_SOR_STOCK_SUFFIX):
+        return normalized
+    if "_" in normalized:
+        return normalized
+    return f"{normalized}{_SOR_STOCK_SUFFIX}"
+
 
 def urllib_transport(
     method: str,
@@ -77,7 +90,7 @@ class MockKiaApiClient:
                 "stk_min_pole_chart_qry": [
                     {
                         "cur_prc": "70000",
-                        "cntr_tm": "20260219090300",
+                        "cntr_tm": "20260219083000",
                     }
                 ],
                 "return_code": 0,
@@ -103,8 +116,9 @@ class MockKiaApiClient:
         return {"access_token": "mock-token", "expires_in": 3600}
 
     def fetch_quote_raw(self, *, mode: Mode | None, symbol: str, api_id: str = "ka10007") -> dict[str, Any]:
+        quote_symbol = _to_quote_sor_symbol(symbol)
         return {
-            "symbol": symbol,
+            "symbol": quote_symbol,
             "cur_prc": "70000",
             "sel_fpr_bid": "70000",
             "buy_fpr_bid": "69900",
@@ -189,7 +203,8 @@ class LiveKiaApiClient:
         sleep_fn: Callable[[float], None] | None = None,
         rand_fn: Callable[[float, float], float] | None = None,
         monotonic_fn: Callable[[], float] | None = None,
-        quote_min_interval_seconds: float = 0.25,
+        quote_min_interval_seconds: float = 1.0,
+        quote_global_min_interval_seconds: float = 0.25,
         idempotency_store: InMemoryIdempotencyStore | None = None,
     ) -> None:
         self._endpoint_resolver = endpoint_resolver
@@ -203,8 +218,10 @@ class LiveKiaApiClient:
         self._rand_fn = rand_fn
         self._monotonic_fn = monotonic_fn or time.monotonic
         self._quote_min_interval_seconds = max(0.0, quote_min_interval_seconds)
+        self._quote_global_min_interval_seconds = max(0.0, quote_global_min_interval_seconds)
         self._quote_rate_lock = Lock()
-        self._last_quote_sent_at: float | None = None
+        self._last_quote_sent_at_by_symbol: dict[tuple[Mode, str], float] = {}
+        self._last_quote_sent_at_global_by_mode: dict[Mode, float] = {}
         self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
 
     def call(
@@ -289,7 +306,7 @@ class LiveKiaApiClient:
         )
 
     def fetch_quote_raw(self, *, mode: Mode | None, symbol: str, api_id: str = "ka10007") -> dict[str, Any]:
-        return self.call(service_type="quote", mode=mode, payload={"stk_cd": symbol}, api_id=api_id)
+        return self.call(service_type="quote", mode=mode, payload={"stk_cd": _to_quote_sor_symbol(symbol)}, api_id=api_id)
 
     def fetch_quotes_batch_raw(
         self,
@@ -307,7 +324,7 @@ class LiveKiaApiClient:
                 quote = self.call(
                     service_type="quote",
                     mode=resolved_mode,
-                    payload={"stk_cd": symbol},
+                    payload={"stk_cd": _to_quote_sor_symbol(symbol)},
                     api_id="ka10007",
                     retry_attempts_override=1,
                 )
@@ -318,7 +335,7 @@ class LiveKiaApiClient:
                         quote = self.call(
                             service_type="quote",
                             mode=resolved_mode,
-                            payload={"stk_cd": symbol},
+                            payload={"stk_cd": _to_quote_sor_symbol(symbol)},
                             api_id="ka10007",
                             retry_attempts_override=1,
                         )
@@ -388,7 +405,7 @@ class LiveKiaApiClient:
         request_guard = self._quote_rate_lock if service_type != "quote" else nullcontext()
         with request_guard:
             if service_type == "quote":
-                self._enforce_quote_rate_limit()
+                self._enforce_quote_rate_limit(mode=mode, payload=payload)
 
             endpoint = self._endpoint_resolver.resolve(mode, service_type)
             headers = {
@@ -421,19 +438,38 @@ class LiveKiaApiClient:
             raise map_exception(ValueError("response is not object"))
         return response
 
-    def _enforce_quote_rate_limit(self) -> None:
+    def _enforce_quote_rate_limit(self, *, mode: Mode, payload: dict[str, Any] | None) -> None:
         sleep_fn = self._sleep_fn if self._sleep_fn is not None else time.sleep
         with self._quote_rate_lock:
-            if self._quote_min_interval_seconds <= 0:
+            if self._quote_min_interval_seconds <= 0 and self._quote_global_min_interval_seconds <= 0:
                 return
+            symbol = ""
+            if payload is not None:
+                symbol = str(payload.get("stk_cd", "")).strip()
+            symbol_key = symbol if symbol else "*"
+            symbol_rate_key = (mode, symbol_key)
             now = self._monotonic_fn()
-            if self._last_quote_sent_at is not None:
-                elapsed = now - self._last_quote_sent_at
-                remaining = self._quote_min_interval_seconds - elapsed
-                if remaining > 0:
-                    sleep_fn(remaining)
-                    now = self._monotonic_fn()
-            self._last_quote_sent_at = now
+            remaining_by_symbol = 0.0
+            if self._quote_min_interval_seconds > 0:
+                last_sent_at = self._last_quote_sent_at_by_symbol.get(symbol_rate_key)
+                if last_sent_at is not None:
+                    elapsed_by_symbol = now - last_sent_at
+                    remaining_by_symbol = self._quote_min_interval_seconds - elapsed_by_symbol
+
+            remaining_global = 0.0
+            if self._quote_global_min_interval_seconds > 0:
+                last_global = self._last_quote_sent_at_global_by_mode.get(mode)
+                if last_global is not None:
+                    elapsed_global = now - last_global
+                    remaining_global = self._quote_global_min_interval_seconds - elapsed_global
+
+            remaining = max(remaining_by_symbol, remaining_global)
+            if remaining > 0:
+                sleep_fn(remaining)
+                now = self._monotonic_fn()
+
+            self._last_quote_sent_at_by_symbol[symbol_rate_key] = now
+            self._last_quote_sent_at_global_by_mode[mode] = now
 
 
 class RoutingKiaApiClient:
@@ -449,7 +485,8 @@ class RoutingKiaApiClient:
         sleep_fn: Callable[[float], None] | None = None,
         rand_fn: Callable[[float, float], float] | None = None,
         monotonic_fn: Callable[[], float] | None = None,
-        quote_min_interval_seconds: float = 0.25,
+        quote_min_interval_seconds: float = 1.0,
+        quote_global_min_interval_seconds: float = 0.25,
     ) -> None:
         self._resolver = CsmEndpointResolver(csm_repository=csm_repository)
         self._transport = transport
@@ -467,6 +504,7 @@ class RoutingKiaApiClient:
             rand_fn=rand_fn,
             monotonic_fn=monotonic_fn,
             quote_min_interval_seconds=quote_min_interval_seconds,
+            quote_global_min_interval_seconds=quote_global_min_interval_seconds,
         )
         self._last_mode: Mode | None = None
 
@@ -499,7 +537,7 @@ class RoutingKiaApiClient:
         return self.call(service_type="auth", mode=mode, payload=None)
 
     def fetch_quote_raw(self, *, mode: Mode | None, symbol: str, api_id: str = "ka10007") -> dict[str, Any]:
-        return self.call(service_type="quote", mode=mode, payload={"stk_cd": symbol}, api_id=api_id)
+        return self.call(service_type="quote", mode=mode, payload={"stk_cd": _to_quote_sor_symbol(symbol)}, api_id=api_id)
 
     def fetch_quotes_batch_raw(
         self,

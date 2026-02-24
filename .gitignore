@@ -25,6 +25,7 @@ runtime/state/
 runtime/reports/
 runtime/config/*.local.json
 runtime/**/*.tmp
+runtime/logs/
 
 # Logs
 *.log

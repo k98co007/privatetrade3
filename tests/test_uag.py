@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -136,7 +137,7 @@ def test_ui_home_contains_auto_refresh_and_required_monitor_columns(tmp_path: Pa
         assert "setInterval(loadStatus, 3000);" in html
         assert "종목명" in html
         assert "종목코드" in html
-        assert "9시3분 가격" in html
+        assert "8시30분 가격" in html
         assert "현재 가격" in html
         assert "전저점 시간" in html
         assert "전저점 가격" in html
@@ -289,9 +290,10 @@ def test_report_monitoring_rows_use_close_price_as_current_price(tmp_path: Path)
     service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
         symbol_code="005930",
         symbol_name="005930",
-        price_at_0903=Decimal("70000"),
+        price_at_0830=Decimal("70000"),
         current_price=Decimal("71000"),
         current_price_at_close=Decimal("70500"),
+        previous_low_tracking_started=True,
         previous_low_time=datetime(2026, 2, 17, 9, 15, 1, tzinfo=timezone(timedelta(hours=9))),
         previous_low_price=Decimal("69300"),
         buy_time=datetime(2026, 2, 17, 9, 22, 10, tzinfo=timezone(timedelta(hours=9))),
@@ -312,7 +314,7 @@ def test_report_monitoring_rows_use_close_price_as_current_price(tmp_path: Path)
     assert row["previousHighPrice"] == "71500"
 
 
-def test_monitoring_rows_hide_previous_low_and_high_when_previous_low_not_below_0903(tmp_path: Path) -> None:
+def test_monitoring_rows_hide_previous_low_and_high_when_previous_low_not_below_0830(tmp_path: Path) -> None:
     service = UagService(
         settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
         credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
@@ -336,7 +338,7 @@ def test_monitoring_rows_hide_previous_low_and_high_when_previous_low_not_below_
     service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
         symbol_code="005930",
         symbol_name="005930",
-        price_at_0903=Decimal("70000"),
+        price_at_0830=Decimal("70000"),
         current_price=Decimal("70500"),
         previous_low_time=datetime(2026, 2, 17, 9, 20, 0, tzinfo=timezone(timedelta(hours=9))),
         previous_low_price=Decimal("69950"),
@@ -346,7 +348,7 @@ def test_monitoring_rows_hide_previous_low_and_high_when_previous_low_not_below_
 
     status = service.monitor_status()
     row = status["monitoringRows"][0]
-    assert row["priceAt0903"] == "70000"
+    assert row["priceAt0830"] == "70000"
     assert row["previousLowTime"] is None
     assert row["previousLowPrice"] is None
     assert row["previousHighTime"] is None
@@ -377,8 +379,9 @@ def test_monitoring_rows_hide_previous_high_when_previous_low_not_bought(tmp_pat
     service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
         symbol_code="005930",
         symbol_name="005930",
-        price_at_0903=Decimal("70000"),
+        price_at_0830=Decimal("70000"),
         current_price=Decimal("70500"),
+        previous_low_tracking_started=True,
         previous_low_time=datetime(2026, 2, 17, 9, 20, 0, tzinfo=timezone(timedelta(hours=9))),
         previous_low_price=Decimal("69300"),
         previous_high_time=datetime(2026, 2, 17, 10, 30, 0, tzinfo=timezone(timedelta(hours=9))),
@@ -387,7 +390,7 @@ def test_monitoring_rows_hide_previous_high_when_previous_low_not_bought(tmp_pat
 
     status = service.monitor_status()
     row = status["monitoringRows"][0]
-    assert row["priceAt0903"] == "70000"
+    assert row["priceAt0830"] == "70000"
     assert row["previousLowTime"] == "09:20:00"
     assert row["previousLowPrice"] == "69300"
     assert row["buyTime"] is None
@@ -422,8 +425,9 @@ def test_monitoring_rows_hide_previous_high_when_before_buy_time_or_below_min_pr
     service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
         symbol_code="005930",
         symbol_name="005930",
-        price_at_0903=Decimal("100"),
+        price_at_0830=Decimal("100"),
         current_price=Decimal("101.5"),
+        previous_low_tracking_started=True,
         previous_low_time=datetime(2026, 2, 17, 9, 10, 0, tzinfo=kst),
         previous_low_price=Decimal("98.0"),
         buy_time=datetime(2026, 2, 17, 9, 20, 0, tzinfo=kst),
@@ -434,8 +438,9 @@ def test_monitoring_rows_hide_previous_high_when_before_buy_time_or_below_min_pr
     service.state.monitoring_snapshots["000660"] = MonitoringSnapshot(
         symbol_code="000660",
         symbol_name="000660",
-        price_at_0903=Decimal("100"),
+        price_at_0830=Decimal("100"),
         current_price=Decimal("100.9"),
+        previous_low_tracking_started=True,
         previous_low_time=datetime(2026, 2, 17, 9, 10, 0, tzinfo=kst),
         previous_low_price=Decimal("98.0"),
         buy_time=datetime(2026, 2, 17, 9, 20, 0, tzinfo=kst),
@@ -544,6 +549,59 @@ def test_update_monitoring_snapshots_tracks_previous_high_only_after_buy_and_plu
     assert snapshot.previous_high_price == Decimal("101.0")
 
 
+def test_update_monitoring_snapshots_tracks_previous_low_only_after_reference_minus_one_percent(tmp_path: Path) -> None:
+    service = UagService(
+        settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
+        credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
+        prp_db_path=str(tmp_path / "runtime" / "state" / "prp.db"),
+    )
+
+    kst = timezone(timedelta(hours=9))
+    service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
+        symbol_code="005930",
+        symbol_name="005930",
+        price_at_0830=Decimal("100"),
+    )
+
+    before_trigger_cycle = SimpleNamespace(
+        quotes=[
+            MarketQuote(
+                symbol="005930",
+                symbol_name="삼성전자",
+                price=Decimal("99.5"),
+                tick_size=1,
+                as_of=datetime(2026, 2, 17, 9, 5, 0, tzinfo=kst),
+            )
+        ],
+        outputs=[],
+    )
+    service._update_monitoring_snapshots(before_trigger_cycle)
+
+    snapshot = service.state.monitoring_snapshots["005930"]
+    assert snapshot.previous_low_tracking_started is False
+    assert snapshot.previous_low_time is None
+    assert snapshot.previous_low_price is None
+
+    trigger_cycle = SimpleNamespace(
+        quotes=[
+            MarketQuote(
+                symbol="005930",
+                symbol_name="삼성전자",
+                price=Decimal("99.0"),
+                tick_size=1,
+                as_of=datetime(2026, 2, 17, 9, 6, 0, tzinfo=kst),
+            )
+        ],
+        outputs=[],
+    )
+    service._update_monitoring_snapshots(trigger_cycle)
+
+    snapshot = service.state.monitoring_snapshots["005930"]
+    assert snapshot.previous_low_tracking_started is True
+    assert snapshot.previous_low_time == datetime(2026, 2, 17, 9, 6, 0, tzinfo=kst)
+    assert snapshot.previous_low_price == Decimal("99.0")
+
+
 def test_update_monitoring_snapshots_does_not_update_previous_low_after_buy(tmp_path: Path) -> None:
     service = UagService(
         settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
@@ -554,13 +612,18 @@ def test_update_monitoring_snapshots_does_not_update_previous_low_after_buy(tmp_
 
     kst = timezone(timedelta(hours=9))
     first_low_time = datetime(2026, 2, 17, 9, 10, 0, tzinfo=kst)
+    service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
+        symbol_code="005930",
+        symbol_name="005930",
+        price_at_0830=Decimal("100"),
+    )
 
     pre_buy_cycle = SimpleNamespace(
         quotes=[
             MarketQuote(
                 symbol="005930",
                 symbol_name="삼성전자",
-                price=Decimal("100"),
+                price=Decimal("99"),
                 tick_size=1,
                 as_of=first_low_time,
             )
@@ -600,7 +663,7 @@ def test_update_monitoring_snapshots_does_not_update_previous_low_after_buy(tmp_
             MarketQuote(
                 symbol="005930",
                 symbol_name="삼성전자",
-                price=Decimal("99"),
+                price=Decimal("98"),
                 tick_size=1,
                 as_of=datetime(2026, 2, 17, 9, 25, 0, tzinfo=kst),
             )
@@ -611,8 +674,150 @@ def test_update_monitoring_snapshots_does_not_update_previous_low_after_buy(tmp_
 
     snapshot = service.state.monitoring_snapshots["005930"]
     assert snapshot.buy_time == buy_signal_time
-    assert snapshot.previous_low_price == Decimal("100")
+    assert snapshot.previous_low_price == Decimal("99")
     assert snapshot.previous_low_time == first_low_time
+
+
+def test_append_position_update_outputs_generates_sell_and_updates_monitoring_history(tmp_path: Path) -> None:
+    service = UagService(
+        settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
+        credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
+        prp_db_path=str(tmp_path / "runtime" / "state" / "prp.db"),
+        monitoring_state_path=str(tmp_path / "runtime" / "state" / "uag_monitoring_state.json"),
+    )
+
+    kst = timezone(timedelta(hours=9))
+    service.state.trading_date = date(2026, 2, 17)
+    service._tse_service = TseService(trading_date=date(2026, 2, 17), watch_symbols=["005930"])
+    service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
+        symbol_code="005930",
+        symbol_name="삼성전자",
+        buy_time=datetime(2026, 2, 17, 9, 20, 0, tzinfo=kst),
+        buy_price=Decimal("100"),
+        previous_high_time=datetime(2026, 2, 17, 9, 30, 0, tzinfo=kst),
+        previous_high_price=Decimal("102"),
+    )
+
+    lock_cycle = SimpleNamespace(
+        quotes=[
+            MarketQuote(
+                symbol="005930",
+                symbol_name="삼성전자",
+                price=Decimal("102"),
+                tick_size=1,
+                as_of=datetime(2026, 2, 17, 9, 31, 0, tzinfo=kst),
+            )
+        ],
+        outputs=[],
+    )
+    service._append_position_update_outputs(lock_cycle)
+    service._update_monitoring_snapshots(lock_cycle)
+
+    sell_cycle = SimpleNamespace(
+        quotes=[
+            MarketQuote(
+                symbol="005930",
+                symbol_name="삼성전자",
+                price=Decimal("100.5"),
+                tick_size=1,
+                as_of=datetime(2026, 2, 17, 9, 32, 0, tzinfo=kst),
+            )
+        ],
+        outputs=[],
+    )
+    service._append_position_update_outputs(sell_cycle)
+
+    assert any(
+        command.reason_code == "TSE_PROFIT_PRESERVATION_BREAK"
+        for output in sell_cycle.outputs
+        for command in output.commands
+    )
+
+    service._update_monitoring_snapshots(sell_cycle)
+    snapshot = service.state.monitoring_snapshots["005930"]
+    assert snapshot.sell_time == datetime(2026, 2, 17, 9, 32, 0, tzinfo=kst)
+    assert snapshot.sell_price == Decimal("100.5")
+
+
+def test_persist_monitoring_state_preserves_existing_history_when_new_snapshot_is_sparse(tmp_path: Path) -> None:
+    monitoring_state_path = tmp_path / "runtime" / "state" / "uag_monitoring_state.json"
+    monitoring_state_path.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_state_path.write_text(
+        '{"tradingDate":"2026-02-20","engineState":"RUNNING","tradingStartedAt":null,"dryRun":true,'
+        '"updatedAt":"2026-02-20T10:00:00+09:00","snapshots":{"005930":{' 
+        '"symbolCode":"005930","symbolName":"삼성전자","priceAt0830":"70000","currentPrice":"70500",'
+        '"currentPriceAtClose":null,"previousLowTrackingStarted":true,"previousLowTime":"2026-02-20T09:20:00+09:00",'
+        '"previousLowPrice":"69000","buyTime":"2026-02-20T09:25:00+09:00","buyPrice":"69200",'
+        '"previousHighTime":"2026-02-20T09:45:00+09:00","previousHighPrice":"71000",'
+        '"sellTime":null,"sellPrice":null}}}',
+        encoding="utf-8",
+    )
+
+    service = UagService(
+        settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
+        credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
+        prp_db_path=str(tmp_path / "runtime" / "state" / "prp.db"),
+        monitoring_state_path=str(monitoring_state_path),
+    )
+
+    service.state.trading_date = date(2026, 2, 20)
+    service.state.monitoring_snapshots = {
+        "005930": MonitoringSnapshot(symbol_code="005930", symbol_name="삼성전자", current_price=Decimal("70600"))
+    }
+    service._persist_monitoring_state()
+
+    persisted = json.loads(monitoring_state_path.read_text(encoding="utf-8"))
+    row = persisted["snapshots"]["005930"]
+    assert row["priceAt0830"] == "70000"
+    assert row["previousLowTrackingStarted"] is True
+    assert row["previousLowPrice"] == "69000"
+    assert row["buyTime"] == "2026-02-20T09:25:00+09:00"
+    assert row["previousHighPrice"] == "71000"
+
+
+def test_update_monitoring_snapshots_skips_persist_when_only_current_price_changes(tmp_path: Path) -> None:
+    service = UagService(
+        settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
+        credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
+        prp_db_path=str(tmp_path / "runtime" / "state" / "prp.db"),
+        monitoring_state_path=str(tmp_path / "runtime" / "state" / "uag_monitoring_state.json"),
+    )
+
+    kst = timezone(timedelta(hours=9))
+    service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
+        symbol_code="005930",
+        symbol_name="005930",
+        current_price=Decimal("100"),
+        previous_low_time=datetime(2026, 2, 17, 9, 0, 0, tzinfo=kst),
+        previous_low_price=Decimal("99"),
+    )
+
+    persist_calls = 0
+
+    def _persist_stub() -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+
+    service._persist_monitoring_state = _persist_stub  # type: ignore[method-assign]
+
+    cycle = SimpleNamespace(
+        quotes=[
+            MarketQuote(
+                symbol="005930",
+                symbol_name="",
+                price=Decimal("101"),
+                tick_size=1,
+                as_of=datetime(2026, 2, 17, 9, 1, 0, tzinfo=kst),
+            )
+        ],
+        outputs=[],
+    )
+
+    service._update_monitoring_snapshots(cycle)
+
+    snapshot = service.state.monitoring_snapshots["005930"]
+    assert snapshot.current_price == Decimal("101")
+    assert persist_calls == 0
 
 
 def test_monitoring_rows_use_symbol_name_from_quote_metadata(tmp_path: Path) -> None:
@@ -665,7 +870,8 @@ def test_report_monitoring_rows_render_hms_in_kst_even_when_snapshot_is_utc(tmp_
     service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
         symbol_code="005930",
         symbol_name="005930",
-        price_at_0903=Decimal("100"),
+        price_at_0830=Decimal("100"),
+        previous_low_tracking_started=True,
         previous_low_time=datetime(2026, 2, 17, 0, 0, 1, tzinfo=timezone.utc),
         previous_low_price=Decimal("99"),
         buy_time=datetime(2026, 2, 17, 0, 22, 10, tzinfo=timezone.utc),
@@ -766,7 +972,7 @@ def test_monitoring_rows_persist_across_service_restart_for_same_day(tmp_path: P
     first.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
         symbol_code="005930",
         symbol_name="005930",
-        price_at_0903=Decimal("70000"),
+        price_at_0830=Decimal("70000"),
         current_price=Decimal("71000"),
         previous_low_time=datetime.now(tz=timezone.utc),
         previous_low_price=Decimal("69900"),
@@ -832,7 +1038,51 @@ def test_monitoring_rows_stale_day_is_not_restored_on_restart(tmp_path: Path) ->
     assert monitoring_state_path.exists() is False
 
 
-def test_initialize_reference_prices_backfills_0903_when_started_after_reference_time(tmp_path: Path) -> None:
+def test_running_engine_is_auto_resumed_on_service_restart(tmp_path: Path) -> None:
+    trading_date = date.today()
+    settings_path = tmp_path / "runtime" / "config" / "settings.local.json"
+    credentials_path = tmp_path / "runtime" / "config" / "credentials.local.json"
+    prp_db_path = tmp_path / "runtime" / "state" / "prp.db"
+    monitoring_state_path = tmp_path / "runtime" / "state" / "uag_monitoring_state.json"
+
+    first = UagService(
+        settings_path=str(settings_path),
+        credentials_path=str(credentials_path),
+        prp_db_path=str(prp_db_path),
+        monitoring_state_path=str(monitoring_state_path),
+    )
+    first.save_settings(
+        {
+            "watchSymbols": ["005930"],
+            "mode": "mock",
+            "liveModeConfirmed": False,
+            "credential": {
+                "appKey": "A" * 16,
+                "appSecret": "B" * 16,
+                "accountNo": "12345678",
+                "userId": "demo",
+            },
+        }
+    )
+
+    first.start_trading(trading_date=trading_date, dry_run=True)
+    first.shutdown()
+
+    second = UagService(
+        settings_path=str(settings_path),
+        credentials_path=str(credentials_path),
+        prp_db_path=str(prp_db_path),
+        monitoring_state_path=str(monitoring_state_path),
+    )
+    try:
+        status = second.monitor_status()
+        assert status["engineState"] == "RUNNING"
+        assert status["tradingDate"] == trading_date.isoformat()
+    finally:
+        second.shutdown()
+
+
+def test_initialize_reference_prices_backfills_0830_when_started_after_reference_time(tmp_path: Path) -> None:
     service = UagService(
         settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
         credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
@@ -844,7 +1094,7 @@ def test_initialize_reference_prices_backfills_0903_when_started_after_reference
     tse_service = TseService(trading_date=date(2026, 2, 17), watch_symbols=["005930"])
 
     class _Gateway:
-        def fetch_reference_price_0903(self, *, mode, symbol):
+        def fetch_reference_price_0830(self, *, mode, symbol):
             assert mode == "live"
             assert symbol == "005930"
             return Decimal("70100")
@@ -858,6 +1108,118 @@ def test_initialize_reference_prices_backfills_0903_when_started_after_reference
     )
 
     snapshot = service.state.monitoring_snapshots["005930"]
-    assert snapshot.price_at_0903 == Decimal("70100")
+    assert snapshot.price_at_0830 == Decimal("70100")
     assert tse_service.ctx.symbols["005930"].reference_price == Decimal("70100")
     assert tse_service.ctx.symbols["005930"].state == "TRACKING"
+
+
+def test_initialize_reference_prices_restores_tse_buy_candidate_from_previous_low_snapshot(tmp_path: Path) -> None:
+    service = UagService(
+        settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
+        credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
+        prp_db_path=str(tmp_path / "runtime" / "state" / "prp.db"),
+        monitoring_state_path=str(tmp_path / "runtime" / "state" / "uag_monitoring_state.json"),
+    )
+    service.state.trading_date = date(2026, 2, 17)
+    service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
+        symbol_code="005930",
+        symbol_name="005930",
+        price_at_0830=Decimal("100"),
+        previous_low_tracking_started=True,
+        previous_low_time=datetime(2026, 2, 17, 9, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+        previous_low_price=Decimal("98.9"),
+    )
+
+    tse_service = TseService(trading_date=date(2026, 2, 17), watch_symbols=["005930"])
+
+    class _Gateway:
+        def fetch_reference_price_0830(self, *, mode, symbol):
+            return Decimal("100")
+
+    service._initialize_reference_prices(
+        tse_service=tse_service,
+        kia_gateway=_Gateway(),  # type: ignore[arg-type]
+        mode="mock",
+        watch_symbols=["005930"],
+        now_value=datetime(2026, 2, 17, 9, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+    )
+
+    symbol_ctx = tse_service.ctx.symbols["005930"]
+    assert symbol_ctx.reference_price == Decimal("100")
+    assert symbol_ctx.state == "BUY_CANDIDATE"
+    assert symbol_ctx.tracked_low == Decimal("98.9")
+
+
+def test_initialize_reference_prices_does_not_restore_buy_candidate_when_tracking_not_started(tmp_path: Path) -> None:
+    service = UagService(
+        settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
+        credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
+        prp_db_path=str(tmp_path / "runtime" / "state" / "prp.db"),
+        monitoring_state_path=str(tmp_path / "runtime" / "state" / "uag_monitoring_state.json"),
+    )
+    service.state.trading_date = date(2026, 2, 17)
+    service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
+        symbol_code="005930",
+        symbol_name="005930",
+        price_at_0830=Decimal("100"),
+        previous_low_time=datetime(2026, 2, 17, 9, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+        previous_low_price=Decimal("98.9"),
+    )
+
+    tse_service = TseService(trading_date=date(2026, 2, 17), watch_symbols=["005930"])
+
+    class _Gateway:
+        def fetch_reference_price_0830(self, *, mode, symbol):
+            return Decimal("100")
+
+    service._initialize_reference_prices(
+        tse_service=tse_service,
+        kia_gateway=_Gateway(),  # type: ignore[arg-type]
+        mode="mock",
+        watch_symbols=["005930"],
+        now_value=datetime(2026, 2, 17, 9, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+    )
+
+    symbol_ctx = tse_service.ctx.symbols["005930"]
+    assert symbol_ctx.reference_price == Decimal("100")
+    assert symbol_ctx.state == "TRACKING"
+    assert symbol_ctx.tracked_low is None
+
+
+def test_initialize_reference_prices_does_not_restore_buy_candidate_after_buy_signal(tmp_path: Path) -> None:
+    service = UagService(
+        settings_path=str(tmp_path / "runtime" / "config" / "settings.local.json"),
+        credentials_path=str(tmp_path / "runtime" / "config" / "credentials.local.json"),
+        prp_db_path=str(tmp_path / "runtime" / "state" / "prp.db"),
+        monitoring_state_path=str(tmp_path / "runtime" / "state" / "uag_monitoring_state.json"),
+    )
+    service.state.trading_date = date(2026, 2, 17)
+    service.state.monitoring_snapshots["005930"] = MonitoringSnapshot(
+        symbol_code="005930",
+        symbol_name="005930",
+        price_at_0830=Decimal("100"),
+        previous_low_tracking_started=True,
+        previous_low_time=datetime(2026, 2, 17, 9, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+        previous_low_price=Decimal("98.9"),
+        buy_time=datetime(2026, 2, 17, 9, 20, 0, tzinfo=timezone(timedelta(hours=9))),
+        buy_price=Decimal("99.5"),
+    )
+
+    tse_service = TseService(trading_date=date(2026, 2, 17), watch_symbols=["005930"])
+
+    class _Gateway:
+        def fetch_reference_price_0830(self, *, mode, symbol):
+            return Decimal("100")
+
+    service._initialize_reference_prices(
+        tse_service=tse_service,
+        kia_gateway=_Gateway(),  # type: ignore[arg-type]
+        mode="mock",
+        watch_symbols=["005930"],
+        now_value=datetime(2026, 2, 17, 9, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+    )
+
+    symbol_ctx = tse_service.ctx.symbols["005930"]
+    assert symbol_ctx.reference_price == Decimal("100")
+    assert symbol_ctx.state == "BUY_BLOCKED"
+    assert symbol_ctx.tracked_low is None

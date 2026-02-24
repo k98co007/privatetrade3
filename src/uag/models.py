@@ -63,9 +63,10 @@ class RuntimeState:
 class MonitoringSnapshot:
     symbol_code: str
     symbol_name: str
-    price_at_0903: Decimal | None = None
+    price_at_0830: Decimal | None = None
     current_price: Decimal | None = None
     current_price_at_close: Decimal | None = None
+    previous_low_tracking_started: bool = False
     previous_low_time: datetime | None = None
     previous_low_price: Decimal | None = None
     buy_time: datetime | None = None

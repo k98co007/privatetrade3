@@ -279,7 +279,7 @@ def should_emit_sell_signal(
 ### 4.2 시세 이벤트 처리 파이프라인
 
 1) 입력 검증: `trading_date` 일치, `current_price > 0`, 감시 목록 포함 여부
-2) 09:03 이전이면 기준가/상태 전이 평가 없이 종료
+2) 08:30 이전이면 기준가/상태 전이 평가 없이 종료
 3) 종목 `base_price` 미확정이면 현재가로 1회 확정하고 `TRACKING` 전이
 4) `buy_entry_blocked_by_degraded=True`이면 신규 BUY 진입 판단은 건너뛰고 종료
 5) `dropRate` 계산 후 1.0% 이상이면 `BUY_CANDIDATE` 진입 또는 `local_low` 갱신
@@ -323,7 +323,7 @@ def should_emit_sell_signal(
 
 | 현재 상태 | 입력 조건 | 다음 상태 | 부수효과 |
 |---|---|---|---|
-| WAIT_REFERENCE | `time >= 09:03` & `base_price is None` | TRACKING | `base_price=current_price` |
+| WAIT_REFERENCE | `time >= 08:30` & `base_price is None` | TRACKING | `base_price=current_price` |
 | TRACKING | `dropRate >= 1.0` | BUY_CANDIDATE | `local_low=current_price`, `BUY_CANDIDATE_ENTERED` |
 | BUY_CANDIDATE | `current_price < local_low` | BUY_CANDIDATE | `local_low=current_price`, `LOCAL_LOW_UPDATED` |
 | BUY_CANDIDATE | `reboundRate >= 0.2` & 스케줄러 미선정 | BUY_CANDIDATE | 큐 대기 유지 |

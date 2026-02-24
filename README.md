@@ -22,6 +22,11 @@ python -m pytest -q
 python src/app.py
 ```
 
+## 로그
+- 콘솔 로그와 함께 파일 로그가 저장됩니다.
+- 경로: `runtime/logs/uag.log`
+- 일자 롤링: 자정 기준으로 `runtime/logs/uag.log.YYYY-MM-DD` 파일이 생성되며 최근 30일 보관됩니다.
+
 ## CI/CD (MVP)
 - GitHub Actions 워크플로우: `.github/workflows/python-ci.yml`
 - 트리거: `push`, `pull_request`

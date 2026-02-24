@@ -25,9 +25,10 @@ from .errors import make_kia_error
 
 
 _LOGGER = logging.getLogger("privatetrade.kia.gateway")
-_REFERENCE_MINUTE_START = dt_time(hour=9, minute=3, second=0)
-_REFERENCE_MINUTE_END = dt_time(hour=9, minute=3, second=59)
+_REFERENCE_MINUTE_START = dt_time(hour=8, minute=30, second=0)
+_REFERENCE_MINUTE_END = dt_time(hour=8, minute=30, second=59)
 _KST = timezone(timedelta(hours=9))
+_SOR_STOCK_SUFFIX = "_AL"
 
 
 def _parse_dt(value: Any) -> datetime:
@@ -43,7 +44,10 @@ def _parse_dt(value: Any) -> datetime:
 
 def _resolve_symbol(value: Any, *, fallback: str = "") -> str:
     if isinstance(value, str) and value.strip():
-        return value.strip()
+        symbol = value.strip()
+        if symbol.endswith(_SOR_STOCK_SUFFIX):
+            return symbol[: -len(_SOR_STOCK_SUFFIX)]
+        return symbol
     return fallback.strip()
 
 
@@ -119,7 +123,7 @@ class DefaultKiaGateway:
             )
 
         return MarketQuote(
-            symbol=str(raw.get("symbol", req.symbol)),
+            symbol=_resolve_symbol(raw.get("symbol", req.symbol), fallback=req.symbol),
             price=normalized_price,
             tick_size=int(raw.get("tick_size", 1)),
             as_of=_parse_dt(raw.get("as_of")),
@@ -137,7 +141,7 @@ class DefaultKiaGateway:
             ),
         )
 
-    def fetch_reference_price_0903(self, *, mode: Mode | None, symbol: str) -> Decimal | None:
+    def fetch_reference_price_0830(self, *, mode: Mode | None, symbol: str) -> Decimal | None:
         base_dt = datetime.now(_KST).strftime("%Y%m%d")
         raw = self._api_client.call(
             service_type="chart",
@@ -274,7 +278,7 @@ class DefaultKiaGateway:
             trde_tp = "0"
         api_id = "kt10000" if req.side == "BUY" else "kt10001"
         payload = {
-            "dmst_stex_tp": "KRX",
+            "dmst_stex_tp": "SOR",
             "stk_cd": req.symbol,
             "ord_qty": str(req.quantity),
             "ord_uv": "" if req.price is None else str(req.price),

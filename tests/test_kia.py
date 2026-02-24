@@ -74,13 +74,13 @@ def test_live_quote_401_triggers_single_force_refresh_and_retry(tmp_path: Path) 
         },
     )
 
-    calls: list[tuple[str, str, dict[str, str]]] = []
+    calls: list[tuple[str, str, dict[str, str], dict | None]] = []
     token_issue_count = 0
     quote_count = 0
 
     def transport(method: str, url: str, headers: dict[str, str], payload: dict | None, query: dict | None, timeout: float):
         nonlocal token_issue_count, quote_count
-        calls.append((method, url, headers))
+        calls.append((method, url, headers, payload))
         if url.endswith("/oauth2/token"):
             token_issue_count += 1
             return 200, {"token": f"token-{token_issue_count}", "expires_in": 120}
@@ -117,14 +117,16 @@ def test_live_quote_401_triggers_single_force_refresh_and_retry(tmp_path: Path) 
     assert quote_count == 2
     assert any(
         headers.get("Authorization") == "Bearer token-1" or headers.get("authorization") == "Bearer token-1"
-        for _, _, headers in calls
+        for _, _, headers, _ in calls
     )
     assert any(
         headers.get("Authorization") == "Bearer token-2" or headers.get("authorization") == "Bearer token-2"
-        for _, _, headers in calls
+        for _, _, headers, _ in calls
     )
-    quote_api_ids = [headers.get("api-id") for _, url, headers in calls if url.endswith("/api/dostk/mrkcond")]
+    quote_api_ids = [headers.get("api-id") for _, url, headers, _ in calls if url.endswith("/api/dostk/mrkcond")]
     assert quote_api_ids == ["ka10007", "ka10007"]
+    quote_payloads = [payload for _, url, _, payload in calls if url.endswith("/api/dostk/mrkcond")]
+    assert quote_payloads == [{"stk_cd": "005930_AL"}, {"stk_cd": "005930_AL"}]
 
 
 def test_live_429_is_mapped_and_retried(tmp_path: Path) -> None:
@@ -187,10 +189,11 @@ def test_fetch_quotes_batch_returns_partial_with_symbol_errors(tmp_path: Path) -
         if url.endswith("/api/dostk/mrkcond"):
             quote_api_ids.append(headers.get("api-id"))
             symbol = str((payload or {}).get("stk_cd"))
-            if symbol == "NOT_FOUND":
+            base_symbol = symbol[:-3] if symbol.endswith("_AL") else symbol
+            if base_symbol == "NOT_FOUND":
                 return 404, {"error": "not found"}
             return 200, {
-                "symbol": symbol,
+                "symbol": base_symbol,
                 "cur_prc": "70100",
                 "tick_size": 1,
                 "as_of": "2026-02-17T09:00:00+00:00",
@@ -264,7 +267,7 @@ def test_fetch_quotes_batch_falls_back_to_request_symbol_when_missing_in_respons
     assert result.partial is False
 
 
-def test_fetch_quotes_batch_enforces_one_request_per_second(tmp_path: Path) -> None:
+def test_fetch_quotes_batch_enforces_one_request_per_symbol_per_second(tmp_path: Path) -> None:
     repo = _write_runtime_files(
         tmp_path,
         mode="live",
@@ -320,7 +323,7 @@ def test_fetch_quotes_batch_enforces_one_request_per_second(tmp_path: Path) -> N
     assert result.errors == []
     assert result.partial is False
     assert len(sleep_calls) == 2
-    assert all(delay == pytest.approx(1.0) for delay in sleep_calls)
+    assert all(delay == pytest.approx(0.25) for delay in sleep_calls)
 
 
 def test_quote_waits_while_order_request_is_in_flight(tmp_path: Path) -> None:
@@ -451,6 +454,15 @@ def test_fetch_quotes_batch_timeout_or_429_retries_only_once(tmp_path: Path) -> 
         },
     )
     quote_attempts = 0
+    clock = {"now": 0.0}
+    sleep_calls: list[float] = []
+
+    def fake_monotonic() -> float:
+        return clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock["now"] += seconds
 
     def transport(method: str, url: str, headers: dict[str, str], payload: dict | None, query: dict | None, timeout: float):
         nonlocal quote_attempts
@@ -467,8 +479,10 @@ def test_fetch_quotes_batch_timeout_or_429_retries_only_once(tmp_path: Path) -> 
             transport=transport,
             retry_base_delay_seconds=0,
             retry_max_delay_seconds=0,
-            sleep_fn=lambda _seconds: None,
+            sleep_fn=fake_sleep,
             rand_fn=lambda _a, _b: 0,
+            monotonic_fn=fake_monotonic,
+            quote_min_interval_seconds=1.0,
         )
     )
 
@@ -479,6 +493,7 @@ def test_fetch_quotes_batch_timeout_or_429_retries_only_once(tmp_path: Path) -> 
     assert result.quotes == []
     assert len(result.errors) == 1
     assert result.errors[0].code == "KIA_RATE_LIMITED"
+    assert sleep_calls == [pytest.approx(1.0)]
 
 
 def test_order_timeout_uses_idempotency_cache_instead_of_retrying_order(tmp_path: Path) -> None:
@@ -590,7 +605,7 @@ def test_mode_switch_invalidates_previous_mode_token_cache(tmp_path: Path) -> No
     assert issued == 2
 
 
-def test_fetch_reference_price_0903_uses_ka10080_chart_and_returns_latest_trade(tmp_path: Path) -> None:
+def test_fetch_reference_price_0830_uses_ka10080_chart_and_returns_latest_trade(tmp_path: Path) -> None:
     repo = _write_runtime_files(
         tmp_path,
         mode="live",
@@ -614,9 +629,9 @@ def test_fetch_reference_price_0903_uses_ka10080_chart_and_returns_latest_trade(
             return 200, {
                 "stk_min_pole_chart_qry": [
                     {"cntr_tm": "20260219090500", "cur_prc": "70200"},
-                    {"cntr_tm": "20260219090305", "cur_prc": "70110"},
-                    {"cntr_tm": "20260219090301", "cur_prc": "70100"},
-                    {"cntr_tm": "20260219090259", "cur_prc": "70090"},
+                    {"cntr_tm": "20260219083005", "cur_prc": "70110"},
+                    {"cntr_tm": "20260219083001", "cur_prc": "70100"},
+                    {"cntr_tm": "20260219082959", "cur_prc": "70090"},
                 ]
             }
         raise AssertionError("unexpected URL")
@@ -632,7 +647,7 @@ def test_fetch_reference_price_0903_uses_ka10080_chart_and_returns_latest_trade(
         )
     )
 
-    reference = gateway.fetch_reference_price_0903(mode="live", symbol="005930")
+    reference = gateway.fetch_reference_price_0830(mode="live", symbol="005930")
 
     assert reference == Decimal("70110")
     assert captured_api_ids == ["ka10080"]

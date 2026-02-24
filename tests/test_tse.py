@@ -269,3 +269,69 @@ def test_degraded_block_prevents_new_buy_signal() -> None:
     assert dropped.commands == []
     assert rebounded.commands == []
     assert service.ctx.symbols["005930"].state == "TRACKING"
+
+
+def test_buy_blocked_symbol_never_enters_buy_candidate_or_emits_buy_signal() -> None:
+    service = TseService(trading_date=date(2026, 2, 17), watch_symbols=["005930"])
+    symbol_ctx = service.ctx.symbols["005930"]
+    symbol_ctx.state = "BUY_BLOCKED"
+    symbol_ctx.reference_price = Decimal("100.0")
+
+    dropped = service.on_quote(
+        QuoteEvent(
+            trading_date=date(2026, 2, 17),
+            occurred_at=_dt(9, 4, 0),
+            symbol="005930",
+            current_price=Decimal("99.0"),
+            sequence=2,
+        )
+    )
+    rebounded = service.on_quote(
+        QuoteEvent(
+            trading_date=date(2026, 2, 17),
+            occurred_at=_dt(9, 4, 10),
+            symbol="005930",
+            current_price=Decimal("99.2"),
+            sequence=3,
+        )
+    )
+
+    assert dropped.commands == []
+    assert rebounded.commands == []
+    assert service.ctx.symbols["005930"].state == "BUY_BLOCKED"
+
+
+def test_rebound_buy_not_emitted_when_price_is_two_ticks_or_more_above_trigger() -> None:
+    service = TseService(trading_date=date(2026, 2, 17), watch_symbols=["005930"])
+
+    service.on_quote(
+        QuoteEvent(
+            trading_date=date(2026, 2, 17),
+            occurred_at=_dt(9, 3, 0),
+            symbol="005930",
+            current_price=Decimal("100000"),
+            sequence=1,
+        )
+    )
+    service.on_quote(
+        QuoteEvent(
+            trading_date=date(2026, 2, 17),
+            occurred_at=_dt(9, 4, 0),
+            symbol="005930",
+            current_price=Decimal("99000"),
+            sequence=2,
+        )
+    )
+
+    output = service.on_quote(
+        QuoteEvent(
+            trading_date=date(2026, 2, 17),
+            occurred_at=_dt(9, 4, 10),
+            symbol="005930",
+            current_price=Decimal("99400"),
+            sequence=3,
+        )
+    )
+
+    assert output.commands == []
+    assert service.ctx.symbols["005930"].state == "BUY_CANDIDATE"

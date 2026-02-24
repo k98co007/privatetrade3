@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from time import sleep as default_sleep
@@ -56,6 +57,7 @@ class QuoteMonitoringLoop:
         self._config = config
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._sleep_fn = sleep_fn or default_sleep
+        self._logger = logging.getLogger("privatetrade.tse.quote_monitoring")
 
         self.state: LoopState = "STOPPED"
         self._consecutive_errors = 0
@@ -72,10 +74,12 @@ class QuoteMonitoringLoop:
         self._consecutive_success = 0
         self._cycle_seq = 0
         self._tse_service.set_buy_entry_blocked_by_degraded(False)
+        self._logger.info("Quote monitoring started: state=%s", self.state)
 
     def stop(self) -> None:
         self.state = "STOPPED"
         self._tse_service.set_buy_entry_blocked_by_degraded(False)
+        self._logger.info("Quote monitoring stopped: state=%s", self.state)
 
     def run_cycle(self) -> QuoteCycleResult:
         if self.state == "STOPPED":
@@ -159,10 +163,24 @@ class QuoteMonitoringLoop:
         if self.state == "DEGRADED" and self._consecutive_success >= self._config.recovery_success_threshold:
             self.state = "RUNNING"
             self._tse_service.set_buy_entry_blocked_by_degraded(False)
+            self._logger.info(
+                "Quote monitoring recovered: state=%s consecutive_success=%s threshold=%s",
+                self.state,
+                self._consecutive_success,
+                self._config.recovery_success_threshold,
+            )
 
     def _on_cycle_failure(self) -> None:
         self._consecutive_success = 0
         self._consecutive_errors += 1
         if self._consecutive_errors >= self._config.consecutive_error_threshold:
+            previous_state = self.state
             self.state = "DEGRADED"
             self._tse_service.set_buy_entry_blocked_by_degraded(True)
+            self._logger.warning(
+                "Quote monitoring degraded: prev_state=%s state=%s consecutive_errors=%s threshold=%s",
+                previous_state,
+                self.state,
+                self._consecutive_errors,
+                self._config.consecutive_error_threshold,
+            )
